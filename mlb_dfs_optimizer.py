@@ -477,7 +477,7 @@ def optimize_dk_mlb(df_input, stack_type, min_sal, max_sal, block_p_h, block_p_p
 
         for slot in slots:
             eligible_players = [p_idx for p_idx in range(n_players) if (p_idx, slot) in x]
-            prob += lpSum([x[p_idx, slot] for slot in eligible_players]) == 1
+            prob += lpSum([x[p, slot] for p in eligible_players]) == 1
 
         prob += lpSum([y[p_idx] for p_idx in range(n_players)]) == 10
 
