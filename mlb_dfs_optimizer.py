@@ -14,49 +14,49 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st.title("⛳ PGA Tour Championship GPP Optimizer (30-Player No-Cut)")
+st.title("⛳ PGA Tour Championship GPP Optimizer (Official 30-Player Field)")
 st.markdown("""
 Custom **Mixed Integer Linear Programming (MILP)** optimization engine engineered specifically for 
-**East Lake Golf Club** and the **30-player FedEx Cup finale**. Features **Roster Architecture Presets** 
-(Balanced 6-Pack, Single Anchor, Stars & Scrubs), **Unspent Salary Uniqueness Arbitrage**, and **Strokes Gained Course-Fit Weighting**.
+**East Lake Golf Club** and the official **30-player FedEx Cup finale** field. Features **Roster Architecture Presets** 
+(Balanced 6-Pack, Single Anchor, Stars & Scrubs), **Unspent Salary Uniqueness Arbitrage**, and **East Lake Strokes Gained Weighting**.
 """)
 
 # -----------------------------------------------------------------------------
-# 2. Built-In 30-Player Tour Championship Slate
+# 2. Official 30-Player Tour Championship Slate
 # -----------------------------------------------------------------------------
 def get_tour_championship_slate():
-    """Returns the full 30-player field with starting strokes, SG metrics, and base projections."""
+    """Returns the official 30-player field with exact DraftKings pricing, IDs, starting strokes, and SG metrics."""
     data = [
-        {"Name": "Scottie Scheffler", "Salary": 12500, "StartingStrokes": -10, "BaseProjection": 122.5, "Ownership": 44.5, "SG_OTT": 1.15, "SG_APP": 1.42, "SG_P": 0.25, "BoB_Pct": 26.8, "ID": "300001"},
-        {"Name": "Xander Schauffele", "Salary": 11600, "StartingStrokes": -8, "BaseProjection": 114.0, "Ownership": 38.0, "SG_OTT": 0.85, "SG_APP": 1.05, "SG_P": 0.65, "BoB_Pct": 25.4, "ID": "300002"},
-        {"Name": "Rory McIlroy", "Salary": 10800, "StartingStrokes": -4, "BaseProjection": 102.5, "Ownership": 28.5, "SG_OTT": 1.25, "SG_APP": 0.75, "SG_P": 0.35, "BoB_Pct": 25.1, "ID": "300003"},
-        {"Name": "Collin Morikawa", "Salary": 10200, "StartingStrokes": -4, "BaseProjection": 98.0, "Ownership": 26.0, "SG_OTT": 0.55, "SG_APP": 1.20, "SG_P": 0.15, "BoB_Pct": 23.9, "ID": "300004"},
-        {"Name": "Ludvig Aberg", "Salary": 9800, "StartingStrokes": -5, "BaseProjection": 95.5, "Ownership": 24.5, "SG_OTT": 0.95, "SG_APP": 0.80, "SG_P": 0.20, "BoB_Pct": 24.2, "ID": "300005"},
-        {"Name": "Hideki Matsuyama", "Salary": 9600, "StartingStrokes": -7, "BaseProjection": 96.0, "Ownership": 27.0, "SG_OTT": 0.45, "SG_APP": 1.10, "SG_P": -0.10, "BoB_Pct": 23.5, "ID": "300006"},
-        {"Name": "Wyndham Clark", "Salary": 9200, "StartingStrokes": -4, "BaseProjection": 89.5, "Ownership": 18.5, "SG_OTT": 0.70, "SG_APP": 0.40, "SG_P": 0.55, "BoB_Pct": 23.8, "ID": "300007"},
-        {"Name": "Patrick Cantlay", "Salary": 9000, "StartingStrokes": -3, "BaseProjection": 88.0, "Ownership": 21.0, "SG_OTT": 0.60, "SG_APP": 0.65, "SG_P": 0.45, "BoB_Pct": 22.9, "ID": "300008"},
-        {"Name": "Viktor Hovland", "Salary": 8800, "StartingStrokes": -2, "BaseProjection": 85.5, "Ownership": 19.5, "SG_OTT": 0.75, "SG_APP": 0.85, "SG_P": -0.05, "BoB_Pct": 23.1, "ID": "300009"},
-        {"Name": "Sam Burns", "Salary": 8600, "StartingStrokes": -4, "BaseProjection": 86.0, "Ownership": 20.5, "SG_OTT": 0.35, "SG_APP": 0.55, "SG_P": 0.75, "BoB_Pct": 24.0, "ID": "300010"},
-        {"Name": "Sahith Theegala", "Salary": 8400, "StartingStrokes": -3, "BaseProjection": 83.0, "Ownership": 17.5, "SG_OTT": 0.20, "SG_APP": 0.60, "SG_P": 0.40, "BoB_Pct": 23.4, "ID": "300011"},
-        {"Name": "Sungjae Im", "Salary": 8200, "StartingStrokes": -3, "BaseProjection": 82.5, "Ownership": 19.0, "SG_OTT": 0.50, "SG_APP": 0.45, "SG_P": 0.30, "BoB_Pct": 22.6, "ID": "300012"},
-        {"Name": "Tony Finau", "Salary": 8000, "StartingStrokes": -3, "BaseProjection": 81.0, "Ownership": 16.5, "SG_OTT": 0.55, "SG_APP": 0.90, "SG_P": -0.30, "BoB_Pct": 22.8, "ID": "300013"},
-        {"Name": "Shane Lowry", "Salary": 7800, "StartingStrokes": -3, "BaseProjection": 79.5, "Ownership": 15.0, "SG_OTT": 0.40, "SG_APP": 0.85, "SG_P": 0.10, "BoB_Pct": 21.9, "ID": "300014"},
-        {"Name": "Russell Henley", "Salary": 7700, "StartingStrokes": -2, "BaseProjection": 78.0, "Ownership": 16.0, "SG_OTT": 0.25, "SG_APP": 0.95, "SG_P": 0.25, "BoB_Pct": 21.7, "ID": "300015"},
-        {"Name": "Keegan Bradley", "Salary": 7600, "StartingStrokes": -6, "BaseProjection": 83.5, "Ownership": 23.0, "SG_OTT": 0.30, "SG_APP": 0.70, "SG_P": 0.15, "BoB_Pct": 22.1, "ID": "300016"},
-        {"Name": "Tommy Fleetwood", "Salary": 7500, "StartingStrokes": -1, "BaseProjection": 75.0, "Ownership": 13.5, "SG_OTT": 0.45, "SG_APP": 0.60, "SG_P": 0.35, "BoB_Pct": 21.8, "ID": "300017"},
-        {"Name": "Justin Thomas", "Salary": 7400, "StartingStrokes": -1, "BaseProjection": 74.5, "Ownership": 14.0, "SG_OTT": 0.35, "SG_APP": 0.80, "SG_P": -0.15, "BoB_Pct": 22.5, "ID": "300018"},
-        {"Name": "Akshay Bhatia", "Salary": 7300, "StartingStrokes": -2, "BaseProjection": 73.0, "Ownership": 12.0, "SG_OTT": 0.40, "SG_APP": 0.75, "SG_P": 0.05, "BoB_Pct": 22.7, "ID": "300019"},
-        {"Name": "Robert MacIntyre", "Salary": 7200, "StartingStrokes": -2, "BaseProjection": 72.0, "Ownership": 11.5, "SG_OTT": 0.30, "SG_APP": 0.35, "SG_P": 0.45, "BoB_Pct": 22.0, "ID": "300020"},
-        {"Name": "Byeong Hun An", "Salary": 7100, "StartingStrokes": -2, "BaseProjection": 71.5, "Ownership": 10.5, "SG_OTT": 0.65, "SG_APP": 0.40, "SG_P": -0.20, "BoB_Pct": 22.4, "ID": "300021"},
-        {"Name": "Billy Horschel", "Salary": 7000, "StartingStrokes": -1, "BaseProjection": 69.5, "Ownership": 9.5, "SG_OTT": 0.20, "SG_APP": 0.30, "SG_P": 0.50, "BoB_Pct": 21.2, "ID": "300022"},
-        {"Name": "Christiaan Bezuidenhout", "Salary": 6900, "StartingStrokes": -2, "BaseProjection": 69.0, "Ownership": 9.0, "SG_OTT": -0.10, "SG_APP": 0.50, "SG_P": 0.60, "BoB_Pct": 21.0, "ID": "300023"},
-        {"Name": "Aaron Rai", "Salary": 6800, "StartingStrokes": -1, "BaseProjection": 68.5, "Ownership": 8.5, "SG_OTT": 0.35, "SG_APP": 0.85, "SG_P": 0.05, "BoB_Pct": 20.8, "ID": "300024"},
-        {"Name": "Taylor Pendrith", "Salary": 6700, "StartingStrokes": -1, "BaseProjection": 67.0, "Ownership": 7.5, "SG_OTT": 0.50, "SG_APP": 0.25, "SG_P": 0.30, "BoB_Pct": 21.5, "ID": "300025"},
-        {"Name": "Cameron Young", "Salary": 6600, "StartingStrokes": 0, "BaseProjection": 65.5, "Ownership": 7.0, "SG_OTT": 0.70, "SG_APP": 0.45, "SG_P": -0.40, "BoB_Pct": 21.8, "ID": "300026"},
-        {"Name": "Tom Hoge", "Salary": 6500, "StartingStrokes": 0, "BaseProjection": 64.0, "Ownership": 6.0, "SG_OTT": 0.05, "SG_APP": 1.05, "SG_P": -0.15, "BoB_Pct": 21.6, "ID": "300027"},
-        {"Name": "Matthieu Pavon", "Salary": 6400, "StartingStrokes": -1, "BaseProjection": 63.0, "Ownership": 5.5, "SG_OTT": 0.25, "SG_APP": 0.20, "SG_P": 0.35, "BoB_Pct": 20.5, "ID": "300028"},
-        {"Name": "Chris Kirk", "Salary": 6300, "StartingStrokes": 0, "BaseProjection": 62.5, "Ownership": 5.0, "SG_OTT": 0.15, "SG_APP": 0.40, "SG_P": 0.15, "BoB_Pct": 20.2, "ID": "300029"},
-        {"Name": "J.T. Poston", "Salary": 6200, "StartingStrokes": 0, "BaseProjection": 61.0, "Ownership": 4.5, "SG_OTT": 0.05, "SG_APP": 0.25, "SG_P": 0.40, "BoB_Pct": 20.0, "ID": "300030"}
+        {"Name": "Scottie Scheffler", "Salary": 14000, "StartingStrokes": -10, "BaseProjection": 125.0, "Ownership": 48.0, "SG_OTT": 1.20, "SG_APP": 1.45, "SG_P": 0.20, "BoB_Pct": 26.5, "ID": "43930074"},
+        {"Name": "Rory McIlroy", "Salary": 11000, "StartingStrokes": -7, "BaseProjection": 105.0, "Ownership": 32.0, "SG_OTT": 1.30, "SG_APP": 0.80, "SG_P": 0.30, "BoB_Pct": 25.0, "ID": "43930075"},
+        {"Name": "Xander Schauffele", "Salary": 10000, "StartingStrokes": -6, "BaseProjection": 98.0, "Ownership": 35.0, "SG_OTT": 0.80, "SG_APP": 1.05, "SG_P": 0.60, "BoB_Pct": 24.8, "ID": "43930076"},
+        {"Name": "Ludvig Aberg", "Salary": 9700, "StartingStrokes": -5, "BaseProjection": 94.5, "Ownership": 26.0, "SG_OTT": 0.95, "SG_APP": 0.80, "SG_P": 0.15, "BoB_Pct": 24.0, "ID": "43930077"},
+        {"Name": "Wyndham Clark", "Salary": 9400, "StartingStrokes": -4, "BaseProjection": 90.0, "Ownership": 21.0, "SG_OTT": 0.70, "SG_APP": 0.40, "SG_P": 0.50, "BoB_Pct": 23.5, "ID": "43930078"},
+        {"Name": "Sam Burns", "Salary": 9200, "StartingStrokes": -4, "BaseProjection": 89.0, "Ownership": 22.5, "SG_OTT": 0.35, "SG_APP": 0.55, "SG_P": 0.75, "BoB_Pct": 24.2, "ID": "43930079"},
+        {"Name": "Tommy Fleetwood", "Salary": 9000, "StartingStrokes": -3, "BaseProjection": 86.0, "Ownership": 19.0, "SG_OTT": 0.50, "SG_APP": 0.65, "SG_P": 0.35, "BoB_Pct": 22.0, "ID": "43930080"},
+        {"Name": "Patrick Cantlay", "Salary": 8900, "StartingStrokes": -3, "BaseProjection": 85.5, "Ownership": 20.0, "SG_OTT": 0.60, "SG_APP": 0.65, "SG_P": 0.40, "BoB_Pct": 22.5, "ID": "43930081"},
+        {"Name": "Cameron Young", "Salary": 8500, "StartingStrokes": -3, "BaseProjection": 84.0, "Ownership": 17.5, "SG_OTT": 0.90, "SG_APP": 0.55, "SG_P": -0.20, "BoB_Pct": 23.0, "ID": "43930082"},
+        {"Name": "Collin Morikawa", "Salary": 8100, "StartingStrokes": -4, "BaseProjection": 86.5, "Ownership": 28.0, "SG_OTT": 0.55, "SG_APP": 1.25, "SG_P": 0.10, "BoB_Pct": 23.8, "ID": "43930083"},
+        {"Name": "Chris Gotterup", "Salary": 7900, "StartingStrokes": -2, "BaseProjection": 79.0, "Ownership": 14.0, "SG_OTT": 0.85, "SG_APP": 0.45, "SG_P": -0.10, "BoB_Pct": 23.2, "ID": "43930084"},
+        {"Name": "Matt Fitzpatrick", "Salary": 7800, "StartingStrokes": -2, "BaseProjection": 80.5, "Ownership": 18.0, "SG_OTT": 0.40, "SG_APP": 0.50, "SG_P": 0.65, "BoB_Pct": 22.4, "ID": "43930085"},
+        {"Name": "Si Woo Kim", "Salary": 7700, "StartingStrokes": -2, "BaseProjection": 81.0, "Ownership": 19.5, "SG_OTT": 0.65, "SG_APP": 0.85, "SG_P": -0.25, "BoB_Pct": 23.0, "ID": "43930086"},
+        {"Name": "Hideki Matsuyama", "Salary": 7600, "StartingStrokes": -7, "BaseProjection": 88.0, "Ownership": 32.0, "SG_OTT": 0.45, "SG_APP": 1.15, "SG_P": -0.15, "BoB_Pct": 23.5, "ID": "43930087"},
+        {"Name": "Russell Henley", "Salary": 7500, "StartingStrokes": -2, "BaseProjection": 77.5, "Ownership": 18.5, "SG_OTT": 0.25, "SG_APP": 0.95, "SG_P": 0.25, "BoB_Pct": 21.8, "ID": "43930088"},
+        {"Name": "Ryan Gerard", "Salary": 7400, "StartingStrokes": -1, "BaseProjection": 74.0, "Ownership": 11.0, "SG_OTT": 0.35, "SG_APP": 0.60, "SG_P": 0.20, "BoB_Pct": 21.5, "ID": "43930089"},
+        {"Name": "Viktor Hovland", "Salary": 7300, "StartingStrokes": -2, "BaseProjection": 76.5, "Ownership": 22.0, "SG_OTT": 0.75, "SG_APP": 0.85, "SG_P": -0.10, "BoB_Pct": 23.1, "ID": "43930090"},
+        {"Name": "J.J. Spaun", "Salary": 7200, "StartingStrokes": -1, "BaseProjection": 71.0, "Ownership": 8.5, "SG_OTT": 0.20, "SG_APP": 0.55, "SG_P": 0.10, "BoB_Pct": 21.0, "ID": "43930091"},
+        {"Name": "Robert MacIntyre", "Salary": 7100, "StartingStrokes": -2, "BaseProjection": 73.5, "Ownership": 13.5, "SG_OTT": 0.30, "SG_APP": 0.40, "SG_P": 0.45, "BoB_Pct": 22.2, "ID": "43930092"},
+        {"Name": "Jacob Bridgeman", "Salary": 7000, "StartingStrokes": -1, "BaseProjection": 75.0, "Ownership": 12.0, "SG_OTT": 0.15, "SG_APP": 0.50, "SG_P": 0.60, "BoB_Pct": 21.7, "ID": "43930093"},
+        {"Name": "Justin Rose", "Salary": 6900, "StartingStrokes": -1, "BaseProjection": 71.5, "Ownership": 10.5, "SG_OTT": 0.25, "SG_APP": 0.60, "SG_P": 0.30, "BoB_Pct": 21.4, "ID": "43930094"},
+        {"Name": "Tom Kim", "Salary": 6800, "StartingStrokes": -1, "BaseProjection": 74.0, "Ownership": 14.5, "SG_OTT": 0.35, "SG_APP": 0.75, "SG_P": 0.15, "BoB_Pct": 22.0, "ID": "43930095"},
+        {"Name": "Min Woo Lee", "Salary": 6700, "StartingStrokes": 0, "BaseProjection": 71.0, "Ownership": 11.0, "SG_OTT": 1.05, "SG_APP": 0.15, "SG_P": 0.30, "BoB_Pct": 23.5, "ID": "43930096"},
+        {"Name": "Gary Woodland", "Salary": 6600, "StartingStrokes": 0, "BaseProjection": 67.5, "Ownership": 6.5, "SG_OTT": 0.60, "SG_APP": 0.50, "SG_P": -0.35, "BoB_Pct": 21.0, "ID": "43930097"},
+        {"Name": "Adam Scott", "Salary": 6500, "StartingStrokes": -1, "BaseProjection": 72.5, "Ownership": 14.0, "SG_OTT": 0.45, "SG_APP": 0.65, "SG_P": 0.15, "BoB_Pct": 22.1, "ID": "43930098"},
+        {"Name": "Kristoffer Reitan", "Salary": 6400, "StartingStrokes": 0, "BaseProjection": 66.0, "Ownership": 5.0, "SG_OTT": 0.30, "SG_APP": 0.30, "SG_P": 0.20, "BoB_Pct": 20.5, "ID": "43930099"},
+        {"Name": "Alex Smalley", "Salary": 6300, "StartingStrokes": 0, "BaseProjection": 67.0, "Ownership": 6.0, "SG_OTT": 0.40, "SG_APP": 0.60, "SG_P": -0.25, "BoB_Pct": 21.2, "ID": "43930100"},
+        {"Name": "Alex Fitzpatrick", "Salary": 6200, "StartingStrokes": 0, "BaseProjection": 68.5, "Ownership": 8.0, "SG_OTT": 0.20, "SG_APP": 0.45, "SG_P": 0.40, "BoB_Pct": 21.6, "ID": "43930101"},
+        {"Name": "Akshay Bhatia", "Salary": 6100, "StartingStrokes": -1, "BaseProjection": 69.5, "Ownership": 13.0, "SG_OTT": 0.40, "SG_APP": 0.75, "SG_P": 0.05, "BoB_Pct": 22.5, "ID": "43930102"},
+        {"Name": "Ryan Fox", "Salary": 6000, "StartingStrokes": 0, "BaseProjection": 66.5, "Ownership": 5.5, "SG_OTT": 0.65, "SG_APP": 0.20, "SG_P": 0.10, "BoB_Pct": 21.0, "ID": "43930103"}
     ]
     return pd.DataFrame(data)
 
@@ -64,12 +64,15 @@ def get_tour_championship_slate():
 # 3. Sidebar Ingestion & Strategy Controls
 # -----------------------------------------------------------------------------
 st.sidebar.header("📁 Slate Ingestion")
-data_source = st.sidebar.radio("Data Source", ["Use Built-in Tour Championship Slate (30 Players)", "Upload DraftKings CSV", "Google Sheets URL"])
+data_source = st.sidebar.radio("Data Source", ["Use Official Tour Championship Field (30 Players)", "Upload DraftKings CSV", "Google Sheets URL"])
 
 if data_source == "Upload DraftKings CSV":
     uploaded = st.sidebar.file_uploader("Upload DK PGA CSV", type=["csv"])
     if uploaded is not None:
-        df_raw = pd.read_csv(uploaded)
+        raw_dk = pd.read_csv(uploaded, skiprows=7 if "Position" not in pd.read_csv(uploaded).columns else 0)
+        cols_to_keep = [c for c in ['Position', 'Name + ID', 'Name', 'ID', 'Salary', 'AvgPointsPerGame'] if c in raw_dk.columns]
+        df_raw = raw_dk[cols_to_keep].dropna(subset=['Name', 'Salary']).copy()
+        df_raw['Salary'] = df_raw['Salary'].astype(int)
     else:
         df_raw = get_tour_championship_slate()
 elif data_source == "Google Sheets URL":
@@ -105,7 +108,7 @@ if "SG_P" not in df_slate.columns:
 if "BoB_Pct" not in df_slate.columns:
     df_slate["BoB_Pct"] = 22.0
 if "ID" not in df_slate.columns:
-    df_slate["ID"] = [f"3000{i:02d}" for i in range(len(df_slate))]
+    df_slate["ID"] = [f"43930{i:03d}" for i in range(len(df_slate))]
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎯 Game Theory & Roster Architecture")
@@ -114,8 +117,8 @@ st.sidebar.header("🎯 Game Theory & Roster Architecture")
 roster_arch = st.sidebar.selectbox(
     "Roster Construction Model",
     [
-        "Balanced 6-Pack (Fades $10k+ Studs)",
         "Single-Stud Anchor (1x $10k+ Stud + 5x Mid-Tier)",
+        "Balanced 6-Pack (Fades $10k+ Studs)",
         "Stars & Scrubs (2+ $10k+ Studs)",
         "Unconstrained (Pure Median Optimal)"
     ],
@@ -125,15 +128,15 @@ roster_arch = st.sidebar.selectbox(
 # Salary Bounds (Unspent Salary Lever)
 col_s1, col_s2 = st.sidebar.columns(2)
 with col_s1:
-    min_salary = st.number_input("Min Salary ($)", value=46500, min_value=40000, max_value=50000, step=100)
+    min_salary = st.number_input("Min Salary ($)", value=47500, min_value=40000, max_value=50000, step=100)
 with col_s2:
     max_salary = st.number_input("Max Salary ($)", value=49400, min_value=45000, max_value=50000, step=100)
 
 # Ownership & Portfolio Controls
 st.sidebar.subheader("Contest Ownership Ceilings")
-max_cum_own = st.sidebar.slider("Max Cumulative Ownership (%)", min_value=60.0, max_value=220.0, value=120.0, step=5.0)
+max_cum_own = st.sidebar.slider("Max Cumulative Ownership (%)", min_value=60.0, max_value=220.0, value=130.0, step=5.0)
 num_lineups = st.sidebar.slider("Lineups to Generate", min_value=1, max_value=15, value=3, step=1)
-max_overlap = st.sidebar.slider("Max Overlap (Shared Golfers)", min_value=1, max_value=5, value=4, step=1)
+max_overlap = st.sidebar.slider("Max Overlap (Shared Golfers)", min_value=1, max_value=5, value=3, step=1)
 
 # Locks & Excludes
 all_golfer_names = sorted(df_slate["Name"].tolist())
@@ -144,11 +147,11 @@ excluded_players = st.sidebar.multiselect("❌ Exclude Players (Completely Fade)
 st.sidebar.markdown("---")
 st.sidebar.header("⛳ East Lake Course-Fit Weighting")
 with st.sidebar.expander("Adjust SG & Birdie Multipliers", expanded=False):
-    w_app = st.slider("SG: Approach Weight", 0.0, 5.0, 2.5, 0.1)
-    w_ott = st.slider("SG: Off-The-Tee Weight", 0.0, 5.0, 1.8, 0.1)
+    w_app = st.slider("SG: Approach Weight", 0.0, 5.0, 3.2, 0.1)
+    w_ott = st.slider("SG: Off-The-Tee Weight", 0.0, 5.0, 2.2, 0.1)
     w_p = st.slider("SG: Putting (Bermuda) Weight", 0.0, 5.0, 1.2, 0.1)
-    w_bob = st.slider("Birdie or Better % Weight", 0.0, 2.0, 0.8, 0.1)
-    w_strokes = st.slider("Starting Strokes Bonus (pts/stroke)", 0.0, 3.0, 1.5, 0.1)
+    w_bob = st.slider("Birdie or Better % Weight", 0.0, 2.0, 1.4, 0.1)
+    w_strokes = st.slider("Starting Strokes Bonus (pts/stroke)", 0.0, 3.0, 1.8, 0.1)
 
 # Compute Adjusted Dynamic Projections
 df_slate["Projection"] = np.round(
