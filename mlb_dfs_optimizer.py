@@ -3,9 +3,14 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from pulp import LpMaximize, LpProblem, LpVariable, lpSum, PULP_CBC_CMD, LpStatus
+import urllib.request
+import json
+import datetime
+import re
+import unicodedata
 
 # -----------------------------------------------------------------------------
-# 1. Page Configuration
+# 1. Page Configuration & Layout
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="DraftKings MLB Single-Entry & GPP Optimizer",
@@ -16,12 +21,137 @@ st.set_page_config(
 
 st.title("⚾ DraftKings MLB Single-Entry & GPP Optimizer")
 st.markdown("""
-Optimize DraftKings MLB lineups using **0-1 Mixed Integer Linear Programming (MILP)** 
-with **5-3, 5-2, and 4-4 stacking architectures**, **pitcher-hitter anti-correlation rules**, and **tournament leverage controls**.
+Optimize DraftKings MLB tournament lineups using **0-1 Mixed Integer Linear Programming (MILP)** 
+with **5-3, 5-2, and 4-4 stacking architectures**, **pitcher-hitter anti-correlation**, and **live MLB confirmed lineup synchronization**.
 """)
 
 # -----------------------------------------------------------------------------
-# 2. Built-In Sample Slate Generator
+# 2. Live MLB Stats API Lineup Fetcher & Matcher
+# -----------------------------------------------------------------------------
+def clean_player_name(name):
+    if not isinstance(name, str):
+        return ""
+    n = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('utf-8')
+    n = re.sub(r'\b(jr\.?|sr\.?|ii|iii|iv)\b', '', n, flags=re.IGNORECASE)
+    n = re.sub(r'[^a-zA-Z\s]', '', n)
+    return " ".join(n.lower().split())
+
+def match_player_to_dk(name, df_team_players):
+    c_name = clean_player_name(name)
+    last_name = c_name.split()[-1] if c_name else ""
+    first_name = c_name.split()[0] if c_name else ""
+    
+    # 1. Exact cleaned match
+    for idx, row in df_team_players.iterrows():
+        dk_c = clean_player_name(row['Name'])
+        if c_name == dk_c:
+            return idx
+            
+    # 2. First + Last name containment
+    for idx, row in df_team_players.iterrows():
+        dk_c = clean_player_name(row['Name'])
+        if last_name and last_name in dk_c and first_name and first_name in dk_c:
+            return idx
+            
+    # 3. Last name exact match if unique in team
+    last_matches = []
+    for idx, row in df_team_players.iterrows():
+        dk_c = clean_player_name(row['Name'])
+        if last_name and dk_c.split()[-1] == last_name:
+            last_matches.append(idx)
+    if len(last_matches) == 1:
+        return last_matches[0]
+        
+    return None
+
+@st.cache_data(ttl=300)
+def fetch_mlb_confirmed_lineups(target_date_str):
+    """Fetches official confirmed starting lineups & probable pitchers from MLB Stats API."""
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={target_date_str}&hydrate=lineups,probablePitcher"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        return None, None, f"Error connecting to MLB API: {e}"
+
+    abbr_map = {
+        "Toronto Blue Jays": "TOR", "New York Yankees": "NYY", "Boston Red Sox": "BOS",
+        "Atlanta Braves": "ATL", "Milwaukee Brewers": "MIL", "Miami Marlins": "MIA",
+        "Washington Nationals": "WSH", "Los Angeles Dodgers": "LAD", "Chicago Cubs": "CHC",
+        "Chicago White Sox": "CWS", "Philadelphia Phillies": "PHI", "New York Mets": "NYM",
+        "Houston Astros": "HOU", "Texas Rangers": "TEX", "Seattle Mariners": "SEA",
+        "San Francisco Giants": "SF", "San Diego Padres": "SD", "St. Louis Cardinals": "STL",
+        "Tampa Bay Rays": "TB", "Baltimore Orioles": "BAL", "Minnesota Twins": "MIN",
+        "Detroit Tigers": "DET", "Cleveland Guardians": "CLE", "Kansas City Royals": "KC",
+        "Cincinnati Reds": "CIN", "Pittsburgh Pirates": "PIT", "Arizona Diamondbacks": "ARI",
+        "Colorado Rockies": "COL", "Oakland Athletics": "OAK", "Los Angeles Angels": "LAA"
+    }
+
+    confirmed_lineups = {}
+    probable_pitchers = {}
+
+    for date_obj in data.get("dates", []):
+        for game in date_obj.get("games", []):
+            teams = game.get("teams", {})
+            away_team_obj = teams.get("away", {}).get("team", {})
+            home_team_obj = teams.get("home", {}).get("team", {})
+            
+            away_abbr = away_team_obj.get("abbreviation") or abbr_map.get(away_team_obj.get("name"), away_team_obj.get("name"))
+            home_abbr = home_team_obj.get("abbreviation") or abbr_map.get(home_team_obj.get("name"), home_team_obj.get("name"))
+            
+            # Starting Pitchers
+            away_sp = teams.get("away", {}).get("probablePitcher", {}).get("fullName")
+            home_sp = teams.get("home", {}).get("probablePitcher", {}).get("fullName")
+            if away_sp: probable_pitchers[away_abbr] = away_sp
+            if home_sp: probable_pitchers[home_abbr] = home_sp
+            
+            # Starting Lineups
+            lineups = game.get("lineups", {})
+            away_players = [p.get("fullName") for p in lineups.get("awayPlayers", [])]
+            home_players = [p.get("fullName") for p in lineups.get("homePlayers", [])]
+            
+            if len(away_players) >= 9:
+                confirmed_lineups[away_abbr] = away_players[:9]
+            if len(home_players) >= 9:
+                confirmed_lineups[home_abbr] = home_players[:9]
+
+    return confirmed_lineups, probable_pitchers, None
+
+def apply_confirmed_lineups_to_df(df_input, confirmed_lineups, probable_pitchers):
+    """Maps confirmed starting pitchers and batting orders 1-9 onto the active DataFrame."""
+    df_updated = df_input.copy()
+    
+    # Initialize all to BattingOrder = 0 (bench/unconfirmed)
+    df_updated["BattingOrder"] = 0
+    df_updated["IsConfirmedStarter"] = False
+    
+    matched_hitters_count = 0
+    matched_pitchers_count = 0
+
+    # 1. Match Pitchers
+    for team, sp_name in probable_pitchers.items():
+        team_pitchers = df_updated[(df_updated["Team"] == team) & (df_updated["Position"].str.contains("P", na=False))]
+        matched_idx = match_player_to_dk(sp_name, team_pitchers)
+        if matched_idx is not None:
+            df_updated.loc[matched_idx, "IsConfirmedStarter"] = True
+            df_updated.loc[matched_idx, "Position"] = "P"
+            matched_pitchers_count += 1
+
+    # 2. Match Starting 9 Hitters
+    for team, batting_order in confirmed_lineups.items():
+        team_hitters = df_updated[(df_updated["Team"] == team) & (~df_updated["Position"].isin(["P", "SP", "RP"]))]
+        for order_idx, player_name in enumerate(batting_order, 1):
+            matched_idx = match_player_to_dk(player_name, team_hitters)
+            if matched_idx is not None:
+                df_updated.loc[matched_idx, "BattingOrder"] = order_idx
+                df_updated.loc[matched_idx, "IsConfirmedStarter"] = True
+                matched_hitters_count += 1
+
+    return df_updated, matched_hitters_count, matched_pitchers_count
+
+# -----------------------------------------------------------------------------
+# 3. Built-In Sample Slate Generator
 # -----------------------------------------------------------------------------
 def get_sample_slate():
     """Generates a sample 3-game slate for immediate testing."""
@@ -82,7 +212,7 @@ def get_sample_slate():
     return pd.DataFrame(data)
 
 # -----------------------------------------------------------------------------
-# 3. CSV Slate Ingestion & Automatic Cleaning
+# 4. CSV Slate Ingestion & Automatic Cleaning
 # -----------------------------------------------------------------------------
 def parse_and_clean_dk_slate(file_source):
     """Robust parser that ingests raw or cleaned DraftKings MLB CSVs."""
@@ -101,10 +231,8 @@ def parse_and_clean_dk_slate(file_source):
     except Exception:
         df = pd.read_csv(file_source, skiprows=7)
 
-    # Drop Unnamed columns from raw exports
     df = df[[c for c in df.columns if not str(c).startswith("Unnamed")]].copy()
     
-    # Standardize column mappings
     col_rename = {}
     for c in df.columns:
         c_clean = str(c).strip().lower().replace(" ", "").replace("_", "").replace(":", "").replace("%", "")
@@ -132,13 +260,11 @@ def parse_and_clean_dk_slate(file_source):
     df = df.rename(columns=col_rename)
     df = df.loc[:, ~df.columns.duplicated()].copy()
 
-    # Drop invalid rows
     if "Name" in df.columns:
         df = df.dropna(subset=["Name"]).copy()
     if "Salary" in df.columns:
         df = df.dropna(subset=["Salary"]).copy()
 
-    # Normalize Team
     if "Team" not in df.columns:
         if "TeamAbbrev" in df.columns:
             df["Team"] = df["TeamAbbrev"]
@@ -146,7 +272,6 @@ def parse_and_clean_dk_slate(file_source):
             df["Team"] = "UNKNOWN"
     df["Team"] = df["Team"].astype(str).str.strip()
 
-    # Normalize Position
     if "Position" not in df.columns:
         if "Roster Position" in df.columns:
             df["Position"] = df["Roster Position"]
@@ -154,7 +279,6 @@ def parse_and_clean_dk_slate(file_source):
             df["Position"] = "OF"
     df["Position"] = df["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
 
-    # Normalize Salary
     if "Salary" in df.columns:
         df["Salary"] = (
             df["Salary"]
@@ -165,7 +289,6 @@ def parse_and_clean_dk_slate(file_source):
         )
         df["Salary"] = pd.to_numeric(df["Salary"], errors="coerce").fillna(0).astype(int)
 
-    # Normalize Projection
     if "Projection" not in df.columns:
         if "AvgPointsPerGame" in df.columns:
             df["Projection"] = pd.to_numeric(df["AvgPointsPerGame"], errors="coerce").fillna(0.0)
@@ -174,7 +297,6 @@ def parse_and_clean_dk_slate(file_source):
     else:
         df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce").fillna(0.0)
 
-    # Normalize Opponent
     if "Opponent" not in df.columns:
         if "Game Info" in df.columns:
             def extract_opp(row):
@@ -189,7 +311,6 @@ def parse_and_clean_dk_slate(file_source):
         else:
             df["Opponent"] = "OPP"
 
-    # Normalize Batting Order
     if "BattingOrder" not in df.columns or df["BattingOrder"].eq(0).all():
         df["BattingOrder"] = 0
         for t in df["Team"].unique():
@@ -199,13 +320,11 @@ def parse_and_clean_dk_slate(file_source):
     else:
         df["BattingOrder"] = pd.to_numeric(df["BattingOrder"], errors="coerce").fillna(0).astype(int)
 
-    # Normalize Ownership
     if "Ownership" not in df.columns:
         df["Ownership"] = np.clip(np.round(df["Projection"] * 2.2, 1), 2.0, 50.0)
     else:
         df["Ownership"] = pd.to_numeric(df["Ownership"], errors="coerce").fillna(10.0)
 
-    # Normalize ImpliedRuns
     if "ImpliedRuns" not in df.columns:
         df["ImpliedRuns"] = 4.5
     else:
@@ -216,23 +335,47 @@ def parse_and_clean_dk_slate(file_source):
 st.sidebar.header("📁 Slate Ingestion")
 data_mode = st.sidebar.radio("Data Source", ["Use Sample Slate (3 Games)", "Upload DraftKings CSV"])
 
+if "mlb_df" not in st.session_state:
+    st.session_state.mlb_df = get_sample_slate()
+
 if data_mode == "Upload DraftKings CSV":
     uploaded_file = st.sidebar.file_uploader("Upload DK Slate CSV", type=["csv"])
     if uploaded_file is not None:
         try:
-            df = parse_and_clean_dk_slate(uploaded_file)
-            st.sidebar.success(f"Loaded {len(df)} players across {df['Team'].nunique()} teams.")
+            st.session_state.mlb_df = parse_and_clean_dk_slate(uploaded_file)
+            st.sidebar.success(f"Loaded {len(st.session_state.mlb_df)} players across {st.session_state.mlb_df['Team'].nunique()} teams.")
         except Exception as e:
             st.sidebar.error(f"Error parsing CSV: {e}")
-            df = get_sample_slate()
-    else:
-        st.info("Awaiting CSV upload. Defaulting to sample slate.")
-        df = get_sample_slate()
+            st.session_state.mlb_df = get_sample_slate()
 else:
-    df = get_sample_slate()
+    if len(st.session_state.mlb_df) > 50:
+        st.session_state.mlb_df = get_sample_slate()
 
 # -----------------------------------------------------------------------------
-# 4. Sidebar Optimization Controls
+# 5. Live MLB API Lineup Sync UI
+# -----------------------------------------------------------------------------
+st.sidebar.markdown("---")
+st.sidebar.header("🔄 Live MLB Lineup Synchronization")
+selected_date = st.sidebar.date_input("Slate Date", datetime.date.today())
+
+if st.sidebar.button("⚡ Sync Confirmed MLB Lineups & SPs", type="secondary", use_container_width=True):
+    with st.spinner("Connecting to MLB Stats API..."):
+        date_str = selected_date.strftime("%Y-%m-%d")
+        c_lineups, p_pitchers, err = fetch_mlb_confirmed_lineups(date_str)
+        
+        if err:
+            st.sidebar.error(err)
+        elif not c_lineups and not p_pitchers:
+            st.sidebar.warning(f"No confirmed lineups posted for {date_str} yet.")
+        else:
+            updated_df, n_hitters, n_pitchers = apply_confirmed_lineups_to_df(st.session_state.mlb_df, c_lineups, p_pitchers)
+            st.session_state.mlb_df = updated_df
+            st.sidebar.success(f"✅ Synced! Confirmed {n_hitters} Starting Hitters and {n_pitchers} Starting Pitchers.")
+
+df = st.session_state.mlb_df
+
+# -----------------------------------------------------------------------------
+# 6. Sidebar Optimization Controls
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Optimization & Stacking Rules")
@@ -266,7 +409,7 @@ num_lineups = st.sidebar.slider("Lineups to Generate", min_value=1, max_value=10
 max_overlap = st.sidebar.slider("Max Player Overlap Between Lineups", min_value=3, max_value=8, value=6, step=1)
 
 # -----------------------------------------------------------------------------
-# 5. Robust MILP Optimization Core
+# 7. Robust MILP Optimization Core
 # -----------------------------------------------------------------------------
 def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, block_p_p, max_own, num_lineups_to_gen, max_overlap_val, enforce_starters=True):
     df_raw = df_input.copy()
@@ -275,12 +418,16 @@ def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, blo
     df_active = df_raw[df_raw["Projection"] > 0].copy().reset_index(drop=True)
     df_active["Position"] = df_active["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
     
-    # 2. Strict Starters Filtering (Version-safe without groupby.apply)
+    # 2. Strict Starters Filtering
     pitchers_list = []
     for t in df_active["Team"].unique():
-        t_p = df_active[(df_active["Team"] == t) & (df_active["Position"] == "P")].sort_values(by=["Projection", "Salary"], ascending=[False, False])
-        if not t_p.empty:
-            pitchers_list.append(t_p.head(1))
+        t_p = df_active[(df_active["Team"] == t) & (df_active["Position"] == "P")]
+        if "IsConfirmedStarter" in t_p.columns and t_p["IsConfirmedStarter"].any():
+            pitchers_list.append(t_p[t_p["IsConfirmedStarter"]].head(1))
+        else:
+            t_p_sorted = t_p.sort_values(by=["Projection", "Salary"], ascending=[False, False])
+            if not t_p_sorted.empty:
+                pitchers_list.append(t_p_sorted.head(1))
             
     pitchers_filtered = pd.concat(pitchers_list).reset_index(drop=True) if pitchers_list else pd.DataFrame()
 
@@ -403,7 +550,7 @@ def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, blo
                 t_hitters = [p_idx for p_idx in hitter_indices if df_players.loc[p_idx, "Team"] == t]
                 prob += lpSum([y[p_idx] for p_idx in t_hitters]) <= 5
 
-        # Lineup Diversity Constraint
+        # Diversity Constraint
         for prev_set in previous_lineup_sets:
             prob += lpSum([y[p_idx] for p_idx in prev_set]) <= max_overlap_val
 
@@ -442,7 +589,7 @@ def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, blo
     return generated_lineups
 
 # -----------------------------------------------------------------------------
-# 6. Interactive UI & Results Display
+# 8. Interactive UI & Results Display
 # -----------------------------------------------------------------------------
 tab_opt, tab_heat, tab_data = st.tabs(["🚀 Lineup Optimizer", "🔥 Matchup Heatmap", "📋 Slate Data"])
 
