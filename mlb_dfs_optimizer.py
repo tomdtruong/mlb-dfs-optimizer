@@ -10,7 +10,7 @@ import re
 import unicodedata
 
 # -----------------------------------------------------------------------------
-# 1. Page Configuration & Setup
+# 1. Page Configuration & Layout
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="DraftKings MLB Single-Entry & GPP Optimizer",
@@ -22,11 +22,11 @@ st.set_page_config(
 st.title("⚾ DraftKings MLB Single-Entry & GPP Optimizer")
 st.markdown("""
 Optimize DraftKings MLB tournament lineups using **0-1 Mixed Integer Linear Programming (MILP)** 
-with **5-3, 5-2, and 4-4 stacking**, **pitcher-hitter anti-correlation**, and **starting lineup / probable pitcher confirmation**.
+with **5-3, 5-2, and 4-4 stacking architectures**, **pitcher-hitter anti-correlation**, and **automated starting lineup & SP confirmation**.
 """)
 
 # -----------------------------------------------------------------------------
-# 2. Helper Functions & Live MLB Stats API Lineup Fetcher
+# 2. Name Cleaning & Matching Helpers
 # -----------------------------------------------------------------------------
 def clean_player_name(name):
     if not isinstance(name, str):
@@ -41,7 +41,7 @@ def match_player_to_dk(name, df_team_players):
     last_name = c_name.split()[-1] if c_name else ""
     first_name = c_name.split()[0] if c_name else ""
     
-    # 1. Exact cleaned match
+    # 1. Exact match
     for idx, row in df_team_players.iterrows():
         dk_c = clean_player_name(row['Name'])
         if c_name == dk_c:
@@ -53,7 +53,7 @@ def match_player_to_dk(name, df_team_players):
         if last_name and last_name in dk_c and first_name and first_name in dk_c:
             return idx
             
-    # 3. Last name exact match if unique in team
+    # 3. Unique last name match
     last_matches = []
     for idx, row in df_team_players.iterrows():
         dk_c = clean_player_name(row['Name'])
@@ -65,7 +65,6 @@ def match_player_to_dk(name, df_team_players):
     return None
 
 def extract_slate_date_from_df(df):
-    """Extracts date from 'Game Info' column (e.g., ATL@MIL 08/22/2026)."""
     if "Game Info" in df.columns:
         for val in df["Game Info"].dropna():
             match = re.search(r'(\d{2}/\d{2}/\d{4})', str(val))
@@ -76,9 +75,11 @@ def extract_slate_date_from_df(df):
                     pass
     return date.today()
 
+# -----------------------------------------------------------------------------
+# 3. Live MLB Stats API Lineup Fetcher & Hard-Exclusion Engine
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_mlb_confirmed_lineups(target_date_str):
-    """Fetches official confirmed starting lineups & probable pitchers from MLB Stats API."""
     url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={target_date_str}&hydrate=lineups,probablePitcher"
     req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     try:
@@ -130,11 +131,59 @@ def fetch_mlb_confirmed_lineups(target_date_str):
 
     return confirmed_lineups, probable_pitchers, None
 
+def apply_live_sync_and_exclude_non_starters(df_input, confirmed_lineups, probable_pitchers):
+    df_out = df_input.copy()
+    
+    if "OriginalProjection" not in df_out.columns:
+        df_out["OriginalProjection"] = df_out["Projection"].copy()
+    else:
+        df_out["Projection"] = df_out["OriginalProjection"].copy()
+
+    df_out["IsConfirmedStarter"] = False
+    
+    matched_pitchers = []
+    matched_hitters = 0
+
+    # 1. PITCHER SYNCHRONIZATION & HARD EXCLUSION
+    for team, sp_name in probable_pitchers.items():
+        team_p_mask = (df_out["Team"] == team) & (df_out["Position"].str.contains("P", na=False))
+        if team_p_mask.any():
+            matched_idx = match_player_to_dk(sp_name, df_out[team_p_mask])
+            if matched_idx is not None:
+                # Confirmed starter keeps projection
+                df_out.loc[matched_idx, "IsConfirmedStarter"] = True
+                matched_pitchers.append((team, df_out.loc[matched_idx, "Name"]))
+                
+                # ALL OTHER PITCHERS ON THIS TEAM GET ZEROED OUT
+                non_sp_mask = team_p_mask & (df_out.index != matched_idx)
+                df_out.loc[non_sp_mask, "Projection"] = 0.0
+                df_out.loc[non_sp_mask, "IsConfirmedStarter"] = False
+
+    # 2. HITTER SYNCHRONIZATION & BENCH ZEROING
+    for team, b_order in confirmed_lineups.items():
+        team_h_mask = (df_out["Team"] == team) & (~df_out["Position"].isin(["P", "SP", "RP"]))
+        if team_h_mask.any():
+            confirmed_h_indices = []
+            for slot_num, p_name in enumerate(b_order, 1):
+                matched_h_idx = match_player_to_dk(p_name, df_out[team_h_mask])
+                if matched_h_idx is not None:
+                    df_out.loc[matched_h_idx, "BattingOrder"] = slot_num
+                    df_out.loc[matched_h_idx, "IsConfirmedStarter"] = True
+                    confirmed_h_indices.append(matched_h_idx)
+                    matched_hitters += 1
+                    
+            # All other hitters on confirmed team are benched
+            bench_mask = team_h_mask & (~df_out.index.isin(confirmed_h_indices))
+            df_out.loc[bench_mask, "BattingOrder"] = 0
+            df_out.loc[bench_mask, "Projection"] = 0.0
+            df_out.loc[bench_mask, "IsConfirmedStarter"] = False
+
+    return df_out, matched_pitchers, matched_hitters
+
 # -----------------------------------------------------------------------------
-# 3. CSV Ingestion & Standardization Parser
+# 4. CSV Ingestion & Parser
 # -----------------------------------------------------------------------------
 def parse_and_clean_dk_slate(file_source):
-    """Robust parser that ingests raw or cleaned DraftKings MLB CSVs."""
     try:
         if isinstance(file_source, str):
             with open(file_source, "r", encoding="utf-8", errors="ignore") as f:
@@ -185,17 +234,11 @@ def parse_and_clean_dk_slate(file_source):
         df = df.dropna(subset=["Salary"]).copy()
 
     if "Team" not in df.columns:
-        if "TeamAbbrev" in df.columns:
-            df["Team"] = df["TeamAbbrev"]
-        else:
-            df["Team"] = "UNKNOWN"
+        df["Team"] = df.get("TeamAbbrev", "UNKNOWN")
     df["Team"] = df["Team"].astype(str).str.strip()
 
     if "Position" not in df.columns:
-        if "Roster Position" in df.columns:
-            df["Position"] = df["Roster Position"]
-        else:
-            df["Position"] = "OF"
+        df["Position"] = df.get("Roster Position", "OF")
     df["Position"] = df["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
 
     if "Salary" in df.columns:
@@ -209,10 +252,7 @@ def parse_and_clean_dk_slate(file_source):
         df["Salary"] = pd.to_numeric(df["Salary"], errors="coerce").fillna(0).astype(int)
 
     if "Projection" not in df.columns:
-        if "AvgPointsPerGame" in df.columns:
-            df["Projection"] = pd.to_numeric(df["AvgPointsPerGame"], errors="coerce").fillna(0.0)
-        else:
-            df["Projection"] = 5.0
+        df["Projection"] = pd.to_numeric(df.get("AvgPointsPerGame", 5.0), errors="coerce").fillna(0.0)
     else:
         df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce").fillna(0.0)
 
@@ -230,12 +270,8 @@ def parse_and_clean_dk_slate(file_source):
         else:
             df["Opponent"] = "OPP"
 
-    if "BattingOrder" not in df.columns or df["BattingOrder"].eq(0).all():
+    if "BattingOrder" not in df.columns:
         df["BattingOrder"] = 0
-        for t in df["Team"].unique():
-            t_hitters = df[(df["Team"] == t) & (df["Position"] != "P")].sort_values(by=["Salary", "Projection"], ascending=[False, False])
-            for rank, idx in enumerate(t_hitters.index, 1):
-                df.loc[idx, "BattingOrder"] = rank
     else:
         df["BattingOrder"] = pd.to_numeric(df["BattingOrder"], errors="coerce").fillna(0).astype(int)
 
@@ -249,10 +285,12 @@ def parse_and_clean_dk_slate(file_source):
     else:
         df["ImpliedRuns"] = pd.to_numeric(df["ImpliedRuns"], errors="coerce").fillna(4.5)
 
+    df["OriginalProjection"] = df["Projection"].copy()
+    df["IsConfirmedStarter"] = False
     return df
 
 # -----------------------------------------------------------------------------
-# 4. Built-In Sample Slate
+# 5. Built-In Sample Slate
 # -----------------------------------------------------------------------------
 def get_sample_slate():
     data = [
@@ -288,39 +326,48 @@ def get_sample_slate():
         {"Name": "Brendan Rodgers", "Position": "2B", "Team": "COL", "Opponent": "LAD", "Salary": 3500, "Projection": 7.0, "Ownership": 6.5, "BattingOrder": 5, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
         {"Name": "Jacob Stallings", "Position": "C", "Team": "COL", "Opponent": "LAD", "Salary": 3100, "Projection": 5.9, "Ownership": 4.2, "BattingOrder": 6, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"}
     ]
-    return pd.DataFrame(data)
+    df = pd.DataFrame(data)
+    df["OriginalProjection"] = df["Projection"].copy()
+    df["IsConfirmedStarter"] = True
+    return df
 
 # -----------------------------------------------------------------------------
-# 5. Sidebar Ingestion & State Management
+# 6. Session State & Slate Ingestion
 # -----------------------------------------------------------------------------
-st.sidebar.header("📁 Slate Ingestion")
-data_mode = st.sidebar.radio("Data Source", ["Use Sample Slate (3 Games)", "Upload DraftKings CSV"])
-
 if "mlb_df" not in st.session_state:
     st.session_state.mlb_df = get_sample_slate()
-if "confirmed_sp_map" not in st.session_state:
-    st.session_state.confirmed_sp_map = {}
+if "last_file_id" not in st.session_state:
+    st.session_state.last_file_id = None
+if "confirmed_pitchers_summary" not in st.session_state:
+    st.session_state.confirmed_pitchers_summary = []
+
+st.sidebar.header("📁 Slate Ingestion")
+data_mode = st.sidebar.radio("Data Source", ["Use Sample Slate (3 Games)", "Upload DraftKings CSV"])
 
 if data_mode == "Upload DraftKings CSV":
     uploaded_file = st.sidebar.file_uploader("Upload DK Slate CSV", type=["csv"])
     if uploaded_file is not None:
-        try:
-            st.session_state.mlb_df = parse_and_clean_dk_slate(uploaded_file)
-            st.sidebar.success(f"Loaded {len(st.session_state.mlb_df)} players across {st.session_state.mlb_df['Team'].nunique()} teams.")
-        except Exception as e:
-            st.sidebar.error(f"Error parsing CSV: {e}")
-            st.session_state.mlb_df = get_sample_slate()
+        file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.last_file_id != file_id:
+            try:
+                st.session_state.mlb_df = parse_and_clean_dk_slate(uploaded_file)
+                st.session_state.last_file_id = file_id
+                st.session_state.confirmed_pitchers_summary = []
+                st.sidebar.success(f"Loaded {len(st.session_state.mlb_df)} players across {st.session_state.mlb_df['Team'].nunique()} teams.")
+            except Exception as e:
+                st.sidebar.error(f"Error parsing CSV: {e}")
+                st.session_state.mlb_df = get_sample_slate()
 else:
-    if len(st.session_state.mlb_df) > 50:
+    if len(st.session_state.mlb_df) > 50 and st.session_state.last_file_id is not None:
         st.session_state.mlb_df = get_sample_slate()
+        st.session_state.last_file_id = None
+        st.session_state.confirmed_pitchers_summary = []
 
 df = st.session_state.mlb_df
-
-# Auto-detect slate date from CSV Game Info
 detected_date = extract_slate_date_from_df(df)
 
 # -----------------------------------------------------------------------------
-# 6. Live MLB Lineup Sync UI
+# 7. Live MLB Lineup & SP Sync Button
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Live MLB Lineup & SP Sync")
@@ -336,71 +383,20 @@ if st.sidebar.button("⚡ Sync Confirmed MLB Lineups & SPs", type="secondary", u
         elif not c_lineups and not p_pitchers:
             st.sidebar.warning(f"No starting lineups posted for {date_str} yet.")
         else:
-            # Update confirmed SP map
-            for team, sp_name in p_pitchers.items():
-                st.session_state.confirmed_sp_map[team] = sp_name
-                
-            # Apply to DataFrame
-            df_updated = df.copy()
-            n_hitters = 0
-            n_pitchers = 0
-            
-            for team, batting_order in c_lineups.items():
-                t_hitters = df_updated[(df_updated["Team"] == team) & (~df_updated["Position"].isin(["P", "SP", "RP"]))]
-                for order_idx, player_name in enumerate(batting_order, 1):
-                    matched_idx = match_player_to_dk(player_name, t_hitters)
-                    if matched_idx is not None:
-                        df_updated.loc[matched_idx, "BattingOrder"] = order_idx
-                        n_hitters += 1
-                        
-            for team, sp_name in p_pitchers.items():
-                t_pitchers = df_updated[(df_updated["Team"] == team) & (df_updated["Position"].str.contains("P", na=False))]
-                matched_idx = match_player_to_dk(sp_name, t_pitchers)
-                if matched_idx is not None:
-                    df_updated.loc[matched_idx, "Position"] = "P"
-                    n_pitchers += 1
-
-            st.session_state.mlb_df = df_updated
-            st.sidebar.success(f"✅ Synced! Found {n_hitters} Starting Hitters & {n_pitchers} Starting Pitchers.")
-
-# -----------------------------------------------------------------------------
-# 7. Interactive Starting Pitcher Confirmation Manager
-# -----------------------------------------------------------------------------
-st.sidebar.markdown("---")
-with st.sidebar.expander("🎯 Confirmed Starting Pitchers (Verify / Override)", expanded=True):
-    st.markdown("<small>Select the confirmed Starting Pitcher for each team. All other pitchers will be automatically excluded.</small>", unsafe_allow_html=True)
-    
-    unique_teams = sorted(df["Team"].unique().tolist())
-    active_sp_selection = {}
-    
-    for team in unique_teams:
-        team_pitchers = df[(df["Team"] == team) & (df["Position"].str.contains("P", na=False))]
-        if not team_pitchers.empty:
-            pitcher_options = team_pitchers["Name"].tolist()
-            
-            # Default selection: check synced SP or fallback to highest projected
-            default_index = 0
-            synced_sp = st.session_state.confirmed_sp_map.get(team)
-            if synced_sp:
-                matched_idx = match_player_to_dk(synced_sp, team_pitchers)
-                if matched_idx is not None:
-                    sp_name = team_pitchers.loc[matched_idx, "Name"]
-                    if sp_name in pitcher_options:
-                        default_index = pitcher_options.index(sp_name)
-            else:
-                top_p = team_pitchers.sort_values(by=["Projection", "Salary"], ascending=[False, False])
-                if not top_p.empty:
-                    top_name = top_p.iloc[0]["Name"]
-                    if top_name in pitcher_options:
-                        default_index = pitcher_options.index(top_name)
-                        
-            chosen_sp = st.selectbox(
-                f"**{team} Starting Pitcher:**", 
-                options=pitcher_options, 
-                index=default_index, 
-                key=f"sp_select_{team}"
+            updated_df, matched_pitchers, matched_hitters = apply_live_sync_and_exclude_non_starters(
+                st.session_state.mlb_df, c_lineups, p_pitchers
             )
-            active_sp_selection[team] = chosen_sp
+            st.session_state.mlb_df = updated_df
+            st.session_state.confirmed_pitchers_summary = matched_pitchers
+            st.sidebar.success(f"✅ Synced! Confirmed {len(matched_pitchers)} Starting Pitchers & {matched_hitters} Hitters. (Non-starters excluded).")
+
+df = st.session_state.mlb_df
+
+# Display active confirmed starting pitchers
+if st.session_state.confirmed_pitchers_summary:
+    with st.sidebar.expander("✅ Active Confirmed SPs", expanded=True):
+        for team, sp_name in st.session_state.confirmed_pitchers_summary:
+            st.markdown(f"- **{team}**: {sp_name}")
 
 # -----------------------------------------------------------------------------
 # 8. Sidebar Optimization Controls
@@ -414,24 +410,16 @@ stack_strategy = st.sidebar.selectbox(
     index=0
 )
 
-# Salary Bounds
 col_s1, col_s2 = st.sidebar.columns(2)
 with col_s1:
     min_sal = st.sidebar.number_input("Min Salary ($)", value=48500, min_value=40000, max_value=50000, step=100)
 with col_s2:
     max_sal = st.sidebar.number_input("Max Salary ($)", value=49900, min_value=45000, max_value=50000, step=100)
 
-# Anti-Correlation Rules
-st.sidebar.subheader("Anti-Correlation Filters")
 no_pitcher_vs_hitter = st.sidebar.checkbox("Block Pitchers vs Opposing Hitters", value=True)
 no_opposing_pitchers = st.sidebar.checkbox("Block Opposing Pitchers (Same Game)", value=True)
+starters_only = st.sidebar.checkbox("Strict Starters Only (Active Lineups & SPs Only)", value=True)
 
-# Starters Only Filter
-st.sidebar.subheader("Roster Integrity")
-starters_only = st.sidebar.checkbox("Strict Starters Only (Batting Order 1–9)", value=True)
-
-# Tournament Diversity & Ownership
-st.sidebar.subheader("Tournament Diversity & Ownership")
 max_roster_own = st.sidebar.slider("Max Cumulative Ownership (%)", min_value=80.0, max_value=350.0, value=260.0, step=5.0)
 num_lineups = st.sidebar.slider("Lineups to Generate", min_value=1, max_value=10, value=3, step=1)
 max_overlap = st.sidebar.slider("Max Player Overlap Between Lineups", min_value=3, max_value=8, value=6, step=1)
@@ -439,31 +427,31 @@ max_overlap = st.sidebar.slider("Max Player Overlap Between Lineups", min_value=
 # -----------------------------------------------------------------------------
 # 9. Fast PuLP MILP Optimization Core
 # -----------------------------------------------------------------------------
-def optimize_dk_mlb(df_input, sp_selection_dict, stack_type, min_salary, max_salary, block_p_h, block_p_p, max_own, num_lineups_to_gen, max_overlap_val, enforce_starters=True):
+def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, block_p_p, max_own, num_lineups_to_gen, max_overlap_val, enforce_starters=True):
     df_raw = df_input.copy()
     
-    # 1. Filter out inactive / 0-projection players
+    # 1. Strictly filter out all inactive, benched, or zero-projection players
     df_active = df_raw[df_raw["Projection"] > 0].copy().reset_index(drop=True)
     df_active["Position"] = df_active["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
     
-    # 2. Strict Pitcher Pool: STRICTLY ONLY THE 1 SELECTED SP PER TEAM
-    pitchers_list = []
-    df_pitcher_sub = df_active[df_active["Position"] == "P"].copy()
-    for team, sp_name in sp_selection_dict.items():
-        matched_sp = df_pitcher_sub[(df_pitcher_sub["Team"] == team) & (df_pitcher_sub["Name"] == sp_name)]
-        if not matched_sp.empty:
-            pitchers_list.append(matched_sp.head(1))
-        else:
-            matched_sp = df_pitcher_sub[(df_pitcher_sub["Team"] == team) & (df_pitcher_sub["Name"].str.contains(sp_name.split()[-1], case=False))]
-            if not matched_sp.empty:
-                pitchers_list.append(matched_sp.head(1))
-                
-    pitchers_filtered = pd.concat(pitchers_list).reset_index(drop=True) if pitchers_list else pd.DataFrame()
+    # 2. Pitcher Filtering: ONLY pitchers with Projection > 0 (and IsConfirmedStarter if synced)
+    pitchers_sub = df_active[df_active["Position"] == "P"].copy()
+    if enforce_starters and pitchers_sub["IsConfirmedStarter"].any():
+        pitchers_filtered = pitchers_sub[pitchers_sub["IsConfirmedStarter"]].reset_index(drop=True)
+    else:
+        # Keep only top 1 SP per team
+        p_list = []
+        for t in pitchers_sub["Team"].unique():
+            t_p = pitchers_sub[pitchers_sub["Team"] == t].sort_values(by=["Projection", "Salary"], ascending=[False, False])
+            if not t_p.empty:
+                p_list.append(t_p.head(1))
+        pitchers_filtered = pd.concat(p_list).reset_index(drop=True) if p_list else pd.DataFrame()
 
-    # 3. Hitters Pool: Batting Orders 1-9
+    # 3. Hitters Filtering: ONLY Batting Orders 1-9
+    hitters_sub = df_active[df_active["Position"] != "P"].copy()
     hitters_list = []
-    for t in df_active["Team"].unique():
-        t_h = df_active[(df_active["Team"] == t) & (df_active["Position"] != "P")]
+    for t in hitters_sub["Team"].unique():
+        t_h = hitters_sub[hitters_sub["Team"] == t]
         if enforce_starters and "BattingOrder" in t_h.columns and (t_h["BattingOrder"] > 0).any():
             valid_b = t_h[t_h["BattingOrder"].between(1, 9)].sort_values(by="BattingOrder")
             if len(valid_b) < 9:
@@ -654,7 +642,6 @@ with tab_opt:
         with st.spinner("Solving Linear Program..."):
             lineups = optimize_dk_mlb(
                 df,
-                sp_selection_dict=active_sp_selection,
                 stack_type=stack_strategy,
                 min_salary=min_sal,
                 max_salary=max_sal,
