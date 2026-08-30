@@ -5,10 +5,10 @@ import plotly.express as px
 from pulp import LpMaximize, LpProblem, LpVariable, lpSum, PULP_CBC_CMD, LpStatus
 
 # -----------------------------------------------------------------------------
-# 1. Page Configuration & Setup
+# 1. Page Configuration
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="DraftKings MLB GPP & Single-Entry Optimizer",
+    page_title="DraftKings MLB Single-Entry & GPP Optimizer",
     page_icon="⚾",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -17,11 +17,11 @@ st.set_page_config(
 st.title("⚾ DraftKings MLB Single-Entry & GPP Optimizer")
 st.markdown("""
 Optimize DraftKings MLB lineups using **0-1 Mixed Integer Linear Programming (MILP)** 
-with **5-3, 5-2, and 4-4 stacking**, **pitcher-hitter anti-correlation rules**, and **single-entry leverage controls**.
+with **5-3, 5-2, and 4-4 stacking architectures**, **pitcher-hitter anti-correlation rules**, and **tournament leverage controls**.
 """)
 
 # -----------------------------------------------------------------------------
-# 2. Built-In Sample Slate Generator (Fallback)
+# 2. Built-In Sample Slate Generator
 # -----------------------------------------------------------------------------
 def get_sample_slate():
     """Generates a sample 3-game slate for immediate testing."""
@@ -84,6 +84,135 @@ def get_sample_slate():
 # -----------------------------------------------------------------------------
 # 3. CSV Slate Ingestion & Automatic Cleaning
 # -----------------------------------------------------------------------------
+def parse_and_clean_dk_slate(file_source):
+    """Robust parser that ingests raw or cleaned DraftKings MLB CSVs."""
+    try:
+        if isinstance(file_source, str):
+            with open(file_source, "r", encoding="utf-8", errors="ignore") as f:
+                first_chunk = "".join([f.readline() for _ in range(12)])
+        else:
+            first_chunk = file_source.read(4096).decode("utf-8", errors="ignore")
+            file_source.seek(0)
+            
+        if "Instructions" in first_chunk or "Locate the player" in first_chunk:
+            df = pd.read_csv(file_source, skiprows=7)
+        else:
+            df = pd.read_csv(file_source)
+    except Exception:
+        df = pd.read_csv(file_source, skiprows=7)
+
+    # Drop Unnamed columns from raw exports
+    df = df[[c for c in df.columns if not str(c).startswith("Unnamed")]].copy()
+    
+    # Standardize column mappings
+    col_rename = {}
+    for c in df.columns:
+        c_clean = str(c).strip().lower().replace(" ", "").replace("_", "").replace(":", "").replace("%", "")
+        if c_clean in ["teamabbrev", "team"]:
+            col_rename[c] = "Team"
+        elif c_clean in ["avgpointspergame", "projection", "proj", "fpts", "points"]:
+            col_rename[c] = "Projection"
+        elif c_clean in ["name", "playername", "player"]:
+            col_rename[c] = "Name"
+        elif c_clean in ["salary", "dksalary"]:
+            col_rename[c] = "Salary"
+        elif c_clean in ["ownership", "own", "ownpct", "projectedownership"]:
+            col_rename[c] = "Ownership"
+        elif c_clean in ["battingorder", "order", "batting"]:
+            col_rename[c] = "BattingOrder"
+        elif c_clean in ["opponent", "opp"]:
+            col_rename[c] = "Opponent"
+        elif c_clean in ["gameinfo", "game"]:
+            col_rename[c] = "Game Info"
+        elif c_clean in ["position", "pos"] and "roster" not in c_clean:
+            col_rename[c] = "Position"
+        elif c_clean in ["impliedruns", "vegas", "impliedtotal"]:
+            col_rename[c] = "ImpliedRuns"
+
+    df = df.rename(columns=col_rename)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    # Drop invalid rows
+    if "Name" in df.columns:
+        df = df.dropna(subset=["Name"]).copy()
+    if "Salary" in df.columns:
+        df = df.dropna(subset=["Salary"]).copy()
+
+    # Normalize Team
+    if "Team" not in df.columns:
+        if "TeamAbbrev" in df.columns:
+            df["Team"] = df["TeamAbbrev"]
+        else:
+            df["Team"] = "UNKNOWN"
+    df["Team"] = df["Team"].astype(str).str.strip()
+
+    # Normalize Position
+    if "Position" not in df.columns:
+        if "Roster Position" in df.columns:
+            df["Position"] = df["Roster Position"]
+        else:
+            df["Position"] = "OF"
+    df["Position"] = df["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
+
+    # Normalize Salary
+    if "Salary" in df.columns:
+        df["Salary"] = (
+            df["Salary"]
+            .astype(str)
+            .str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        df["Salary"] = pd.to_numeric(df["Salary"], errors="coerce").fillna(0).astype(int)
+
+    # Normalize Projection
+    if "Projection" not in df.columns:
+        if "AvgPointsPerGame" in df.columns:
+            df["Projection"] = pd.to_numeric(df["AvgPointsPerGame"], errors="coerce").fillna(0.0)
+        else:
+            df["Projection"] = 5.0
+    else:
+        df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce").fillna(0.0)
+
+    # Normalize Opponent
+    if "Opponent" not in df.columns:
+        if "Game Info" in df.columns:
+            def extract_opp(row):
+                g = str(row.get("Game Info", ""))
+                t = str(row.get("Team", ""))
+                if "@" in g:
+                    matchup = g.split(" ")[0].split("@")
+                    if len(matchup) == 2:
+                        return matchup[1] if t == matchup[0] else matchup[0]
+                return "OPP"
+            df["Opponent"] = df.apply(extract_opp, axis=1)
+        else:
+            df["Opponent"] = "OPP"
+
+    # Normalize Batting Order
+    if "BattingOrder" not in df.columns or df["BattingOrder"].eq(0).all():
+        df["BattingOrder"] = 0
+        for t in df["Team"].unique():
+            t_hitters = df[(df["Team"] == t) & (df["Position"] != "P")].sort_values(by=["Salary", "Projection"], ascending=[False, False])
+            for rank, idx in enumerate(t_hitters.index, 1):
+                df.loc[idx, "BattingOrder"] = rank
+    else:
+        df["BattingOrder"] = pd.to_numeric(df["BattingOrder"], errors="coerce").fillna(0).astype(int)
+
+    # Normalize Ownership
+    if "Ownership" not in df.columns:
+        df["Ownership"] = np.clip(np.round(df["Projection"] * 2.2, 1), 2.0, 50.0)
+    else:
+        df["Ownership"] = pd.to_numeric(df["Ownership"], errors="coerce").fillna(10.0)
+
+    # Normalize ImpliedRuns
+    if "ImpliedRuns" not in df.columns:
+        df["ImpliedRuns"] = 4.5
+    else:
+        df["ImpliedRuns"] = pd.to_numeric(df["ImpliedRuns"], errors="coerce").fillna(4.5)
+
+    return df
+
 st.sidebar.header("📁 Slate Ingestion")
 data_mode = st.sidebar.radio("Data Source", ["Use Sample Slate (3 Games)", "Upload DraftKings CSV"])
 
@@ -91,50 +220,8 @@ if data_mode == "Upload DraftKings CSV":
     uploaded_file = st.sidebar.file_uploader("Upload DK Slate CSV", type=["csv"])
     if uploaded_file is not None:
         try:
-            sample_bytes = uploaded_file.read(1024).decode('utf-8', errors='ignore')
-            uploaded_file.seek(0)
-            
-            # Check if file has DK instructions metadata header
-            if "Instructions" in sample_bytes or "Locate the player" in sample_bytes:
-                df = pd.read_csv(uploaded_file, skiprows=7)
-                cols_to_keep = ['Position', 'Name + ID', 'Name', 'ID', 'Roster Position', 'Salary', 'Game Info', 'TeamAbbrev', 'AvgPointsPerGame']
-                existing_cols = [c for c in cols_to_keep if c in df.columns]
-                df = df[existing_cols].dropna(subset=['Name', 'Salary']).copy()
-                
-                if 'TeamAbbrev' in df.columns and 'Team' not in df.columns:
-                    df['Team'] = df['TeamAbbrev']
-                if 'AvgPointsPerGame' in df.columns and 'Projection' not in df.columns:
-                    df['Projection'] = pd.to_numeric(df['AvgPointsPerGame'], errors='coerce').fillna(0.0)
-                if 'Opponent' not in df.columns and 'Game Info' in df.columns:
-                    def parse_opp(row):
-                        g = str(row.get('Game Info', ''))
-                        t = str(row.get('Team', ''))
-                        if '@' in g:
-                            match = g.split(' ')[0].split('@')
-                            if len(match) == 2:
-                                return match[1] if t == match[0] else match[0]
-                        return "OPP"
-                    df['Opponent'] = df.apply(parse_opp, axis=1)
-                if 'BattingOrder' not in df.columns:
-                    df['BattingOrder'] = 0
-                if 'ImpliedRuns' not in df.columns:
-                    df['ImpliedRuns'] = 4.5
-                if 'Ownership' not in df.columns:
-                    df['Ownership'] = 10.0
-            else:
-                df = pd.read_csv(uploaded_file)
-                if 'Projection' not in df.columns and 'AvgPointsPerGame' in df.columns:
-                    df['Projection'] = pd.to_numeric(df['AvgPointsPerGame'], errors='coerce').fillna(0.0)
-                if 'Team' not in df.columns and 'TeamAbbrev' in df.columns:
-                    df['Team'] = df['TeamAbbrev']
-                if 'Opponent' not in df.columns:
-                    df['Opponent'] = "OPP"
-                if 'BattingOrder' not in df.columns:
-                    df['BattingOrder'] = 0
-                if 'ImpliedRuns' not in df.columns:
-                    df['ImpliedRuns'] = 4.5
-                if 'Ownership' not in df.columns:
-                    df['Ownership'] = 10.0
+            df = parse_and_clean_dk_slate(uploaded_file)
+            st.sidebar.success(f"Loaded {len(df)} players across {df['Team'].nunique()} teams.")
         except Exception as e:
             st.sidebar.error(f"Error parsing CSV: {e}")
             df = get_sample_slate()
@@ -144,23 +231,11 @@ if data_mode == "Upload DraftKings CSV":
 else:
     df = get_sample_slate()
 
-# Type Normalization
-if "Salary" in df.columns:
-    df["Salary"] = pd.to_numeric(df["Salary"], errors="coerce").fillna(0).astype(int)
-if "Projection" in df.columns:
-    df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce").fillna(0.0)
-if "Ownership" in df.columns:
-    df["Ownership"] = pd.to_numeric(df["Ownership"], errors="coerce").fillna(0.0)
-if "BattingOrder" in df.columns:
-    df["BattingOrder"] = pd.to_numeric(df["BattingOrder"], errors="coerce").fillna(0).astype(int)
-if "ImpliedRuns" in df.columns:
-    df["ImpliedRuns"] = pd.to_numeric(df["ImpliedRuns"], errors="coerce").fillna(4.5)
-
 # -----------------------------------------------------------------------------
 # 4. Sidebar Optimization Controls
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
-st.sidebar.header("⚙️ Single-Entry & GPP Rules")
+st.sidebar.header("⚙️ Optimization & Stacking Rules")
 
 stack_strategy = st.sidebar.selectbox(
     "Stack Architecture",
@@ -168,7 +243,7 @@ stack_strategy = st.sidebar.selectbox(
     index=0
 )
 
-# Salary Constraints
+# Salary Bounds
 col_s1, col_s2 = st.sidebar.columns(2)
 with col_s1:
     min_sal = st.sidebar.number_input("Min Salary ($)", value=48500, min_value=40000, max_value=50000, step=100)
@@ -184,40 +259,55 @@ no_opposing_pitchers = st.sidebar.checkbox("Block Opposing Pitchers (Same Game)"
 st.sidebar.subheader("Roster Integrity")
 starters_only = st.sidebar.checkbox("Strict Starters Only (Batting Order 1–9)", value=True)
 
-# Tournament Controls
+# Tournament Diversity & Ownership
 st.sidebar.subheader("Tournament Diversity & Ownership")
-max_roster_own = st.sidebar.slider("Max Cumulative Ownership (%)", min_value=80.0, max_value=350.0, value=250.0, step=5.0)
+max_roster_own = st.sidebar.slider("Max Cumulative Ownership (%)", min_value=80.0, max_value=350.0, value=260.0, step=5.0)
 num_lineups = st.sidebar.slider("Lineups to Generate", min_value=1, max_value=10, value=3, step=1)
 max_overlap = st.sidebar.slider("Max Player Overlap Between Lineups", min_value=3, max_value=8, value=6, step=1)
 
 # -----------------------------------------------------------------------------
-# 5. PuLP MILP Optimization Core
+# 5. Robust MILP Optimization Core
 # -----------------------------------------------------------------------------
 def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, block_p_p, max_own, num_lineups_to_gen, max_overlap_val, enforce_starters=True):
     df_raw = df_input.copy()
     
-    # 1. Active player filter
-    df_active = df_raw[df_raw["Projection"] > 0].copy()
+    # 1. Filter out inactive / 0-projection players
+    df_active = df_raw[df_raw["Projection"] > 0].copy().reset_index(drop=True)
     df_active["Position"] = df_active["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
     
-    # 2. Strict Starters Filtering
-    pitchers_filtered = df_active[df_active["Position"] == "P"].groupby("Team", as_index=False).apply(
-        lambda g: g.nlargest(1, "Projection")
-    ).reset_index(drop=True)
-    
-    hitters_raw = df_active[df_active["Position"] != "P"]
-    if enforce_starters and "BattingOrder" in hitters_raw.columns and (hitters_raw["BattingOrder"] <= 9).any() and (hitters_raw["BattingOrder"] > 0).any():
-        hitters_filtered = hitters_raw[hitters_raw["BattingOrder"].between(1, 9)].groupby("Team", as_index=False).apply(
-            lambda g: g.nsmallest(9, "BattingOrder")
-        ).reset_index(drop=True)
-    else:
-        hitters_filtered = hitters_raw.groupby("Team", as_index=False).apply(
-            lambda g: g.nlargest(9, "Projection")
-        ).reset_index(drop=True)
-    
+    # 2. Strict Starters Filtering (Version-safe without groupby.apply)
+    pitchers_list = []
+    for t in df_active["Team"].unique():
+        t_p = df_active[(df_active["Team"] == t) & (df_active["Position"] == "P")].sort_values(by=["Projection", "Salary"], ascending=[False, False])
+        if not t_p.empty:
+            pitchers_list.append(t_p.head(1))
+            
+    pitchers_filtered = pd.concat(pitchers_list).reset_index(drop=True) if pitchers_list else pd.DataFrame()
+
+    hitters_list = []
+    for t in df_active["Team"].unique():
+        t_h = df_active[(df_active["Team"] == t) & (df_active["Position"] != "P")]
+        if enforce_starters and "BattingOrder" in t_h.columns and (t_h["BattingOrder"] > 0).any():
+            valid_b = t_h[t_h["BattingOrder"].between(1, 9)].sort_values(by="BattingOrder")
+            if len(valid_b) < 9:
+                rem = t_h[~t_h.index.isin(valid_b.index)].sort_values(by="Projection", ascending=False)
+                t_h_sel = pd.concat([valid_b, rem]).head(9)
+            else:
+                t_h_sel = valid_b.head(9)
+        else:
+            t_h_sel = t_h.sort_values(by=["Projection", "Salary"], ascending=[False, False]).head(9)
+            
+        if not t_h_sel.empty:
+            hitters_list.append(t_h_sel)
+
+    hitters_filtered = pd.concat(hitters_list).reset_index(drop=True) if hitters_list else pd.DataFrame()
+
     df_players = pd.concat([pitchers_filtered, hitters_filtered]).reset_index(drop=True)
     n_players = len(df_players)
     
+    if n_players == 0:
+        return []
+
     slots = ["P1", "P2", "C", "1B", "2B", "3B", "SS", "OF1", "OF2", "OF3"]
     teams = df_players["Team"].unique().tolist()
     
