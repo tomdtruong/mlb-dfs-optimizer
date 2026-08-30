@@ -10,7 +10,7 @@ import re
 import unicodedata
 
 # -----------------------------------------------------------------------------
-# 1. Page Configuration & Setup
+# 1. Page Configuration & Layout
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="DraftKings MLB Single-Entry & GPP Optimizer",
@@ -41,16 +41,19 @@ def match_player_to_dk(name, df_team_players):
     last_name = c_name.split()[-1] if c_name else ""
     first_name = c_name.split()[0] if c_name else ""
     
+    # 1. Exact match
     for idx, row in df_team_players.iterrows():
         dk_c = clean_player_name(row['Name'])
         if c_name == dk_c:
             return idx
             
+    # 2. First + Last name containment
     for idx, row in df_team_players.iterrows():
         dk_c = clean_player_name(row['Name'])
         if last_name and last_name in dk_c and first_name and first_name in dk_c:
             return idx
             
+    # 3. Unique last name match
     last_matches = []
     for idx, row in df_team_players.iterrows():
         dk_c = clean_player_name(row['Name'])
@@ -73,7 +76,53 @@ def extract_slate_date_from_df(df):
     return date.today()
 
 # -----------------------------------------------------------------------------
-# 3. Live MLB Stats API Two-Tier Lineup Sync Engine
+# 3. Slate Integrity & Two-Tier Lineup Normalizer
+# -----------------------------------------------------------------------------
+def ensure_full_slate_integrity(df_input):
+    """
+    Guarantees EVERY team on the slate has 9 active starting hitters (Orders 1-9)
+    and exactly 1 starting pitcher, preventing late games from being excluded.
+    """
+    df_out = df_input.copy()
+    if "LineupStatus" not in df_out.columns:
+        df_out["LineupStatus"] = "PROJECTED 🟡"
+    if "IsConfirmedStarter" not in df_out.columns:
+        df_out["IsConfirmedStarter"] = False
+
+    for team in df_out["Team"].unique():
+        # Hitters
+        team_h_mask = (df_out["Team"] == team) & (~df_out["Position"].isin(["P", "SP", "RP"]))
+        team_hitters = df_out[team_h_mask]
+        
+        has_full_order = (team_hitters["BattingOrder"].between(1, 9)).sum() >= 9
+        if not has_full_order and not team_hitters.empty:
+            top_9_idx = team_hitters.sort_values(by=["Projection", "Salary"], ascending=[False, False]).index[:9]
+            for rank, idx in enumerate(top_9_idx, 1):
+                df_out.loc[idx, "BattingOrder"] = rank
+                df_out.loc[idx, "IsConfirmedStarter"] = True
+                if df_out.loc[idx, "LineupStatus"] != "CONFIRMED 🟢":
+                    df_out.loc[idx, "LineupStatus"] = "PROJECTED 🟡"
+                    
+            bench_idx = team_hitters[~team_hitters.index.isin(top_9_idx)].index
+            df_out.loc[bench_idx, "BattingOrder"] = 0
+            df_out.loc[bench_idx, "Projection"] = 0.0
+            df_out.loc[bench_idx, "LineupStatus"] = "BENCH ❌"
+            df_out.loc[bench_idx, "IsConfirmedStarter"] = False
+
+        # Pitchers
+        team_p_mask = (df_out["Team"] == team) & (df_out["Position"].str.contains("P", na=False))
+        team_pitchers = df_out[team_p_mask]
+        if not team_pitchers.empty and not team_pitchers["IsConfirmedStarter"].any():
+            top_sp_idx = team_pitchers.sort_values(by=["Projection", "Salary"], ascending=[False, False]).index[:1]
+            df_out.loc[top_sp_idx, "IsConfirmedStarter"] = True
+            non_sp_idx = team_pitchers[~team_pitchers.index.isin(top_sp_idx)].index
+            df_out.loc[non_sp_idx, "Projection"] = 0.0
+            df_out.loc[non_sp_idx, "IsConfirmedStarter"] = False
+
+    return df_out
+
+# -----------------------------------------------------------------------------
+# 4. Live MLB Stats API Two-Tier Lineup Sync Engine
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_mlb_confirmed_lineups(target_date_str):
@@ -110,11 +159,13 @@ def fetch_mlb_confirmed_lineups(target_date_str):
             away_abbr = away_team_obj.get("abbreviation") or abbr_map.get(away_team_obj.get("name"), away_team_obj.get("name"))
             home_abbr = home_team_obj.get("abbreviation") or abbr_map.get(home_team_obj.get("name"), home_team_obj.get("name"))
             
+            # Probable Starting Pitchers
             away_sp = teams.get("away", {}).get("probablePitcher", {}).get("fullName")
             home_sp = teams.get("home", {}).get("probablePitcher", {}).get("fullName")
             if away_sp: probable_pitchers[away_abbr] = away_sp
             if home_sp: probable_pitchers[home_abbr] = home_sp
             
+            # Official Batting Orders
             lineups = game.get("lineups", {})
             away_players = [p.get("fullName") for p in lineups.get("awayPlayers", [])]
             home_players = [p.get("fullName") for p in lineups.get("homePlayers", [])]
@@ -127,10 +178,6 @@ def fetch_mlb_confirmed_lineups(target_date_str):
     return confirmed_lineups, probable_pitchers, None
 
 def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
-    """
-    Applies confirmed lineups to early games while generating projected starting 9s 
-    and probable starting pitchers for late unconfirmed games.
-    """
     df_out = df_input.copy()
     
     if "OriginalProjection" not in df_out.columns:
@@ -157,9 +204,8 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
             matched_idx = match_player_to_dk(sp_name, df_out[team_p_mask])
             if matched_idx is not None:
                 df_out.loc[matched_idx, "IsConfirmedStarter"] = True
-                matched_pitchers_summary.append((team, df_out.loc[matched_idx, "Name"], "Probable Starter"))
+                matched_pitchers_summary.append((team, df_out.loc[matched_idx, "Name"], "Probable SP 🟢"))
                 
-                # Zero out non-starting pitchers on this team
                 non_sp = team_p_mask & (df_out.index != matched_idx)
                 df_out.loc[non_sp, "Projection"] = 0.0
                 df_out.loc[non_sp, "IsConfirmedStarter"] = False
@@ -168,18 +214,17 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
             if len(top_p_indices) > 0:
                 top_sp_idx = top_p_indices[0]
                 df_out.loc[top_sp_idx, "IsConfirmedStarter"] = True
-                matched_pitchers_summary.append((team, df_out.loc[top_sp_idx, "Name"], "Projected SP"))
+                matched_pitchers_summary.append((team, df_out.loc[top_sp_idx, "Name"], "Projected SP 🟡"))
                 non_sp = team_p_mask & (df_out.index != top_sp_idx)
                 df_out.loc[non_sp, "Projection"] = 0.0
 
-    # 2. Hitter Synchronization (Confirmed vs Projected Teams)
+    # 2. Hitter Synchronization (Confirmed vs Projected)
     for team in df_out["Team"].unique():
         team_h_mask = (df_out["Team"] == team) & (~df_out["Position"].isin(["P", "SP", "RP"]))
         if not team_h_mask.any():
             continue
 
         if team in confirmed_lineups and len(confirmed_lineups[team]) >= 9:
-            # Tier 1: Confirmed Starting Lineup (🟢)
             confirmed_teams_count += 1
             matched_h_indices = []
             for slot_num, p_name in enumerate(confirmed_lineups[team], 1):
@@ -196,7 +241,6 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
             df_out.loc[bench_mask, "LineupStatus"] = "BENCH ❌"
             df_out.loc[bench_mask, "IsConfirmedStarter"] = False
         else:
-            # Tier 2: Projected Starting Lineup for Later Games (🟡)
             projected_teams_count += 1
             top_9_h_indices = df_out[team_h_mask].sort_values(by=["Projection", "Salary"], ascending=[False, False]).index[:9]
             for rank, h_idx in enumerate(top_9_h_indices, 1):
@@ -213,7 +257,7 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
     return df_out, matched_pitchers_summary, confirmed_teams_count, projected_teams_count
 
 # -----------------------------------------------------------------------------
-# 4. CSV Ingestion & Parser
+# 5. CSV Ingestion & Parser
 # -----------------------------------------------------------------------------
 def parse_and_clean_dk_slate(file_source):
     try:
@@ -320,10 +364,11 @@ def parse_and_clean_dk_slate(file_source):
     df["OriginalProjection"] = df["Projection"].copy()
     df["LineupStatus"] = "PROJECTED 🟡"
     df["IsConfirmedStarter"] = True
-    return df
+    
+    return ensure_full_slate_integrity(df)
 
 # -----------------------------------------------------------------------------
-# 5. Built-In Sample Slate
+# 6. Built-In Sample Slate
 # -----------------------------------------------------------------------------
 def get_sample_slate():
     data = [
@@ -366,7 +411,7 @@ def get_sample_slate():
     return df
 
 # -----------------------------------------------------------------------------
-# 6. Session State & Slate Ingestion
+# 7. Session State & Slate Ingestion
 # -----------------------------------------------------------------------------
 if "mlb_df" not in st.session_state:
     st.session_state.mlb_df = get_sample_slate()
@@ -401,7 +446,7 @@ df = st.session_state.mlb_df
 detected_date = extract_slate_date_from_df(df)
 
 # -----------------------------------------------------------------------------
-# 7. Live MLB Lineup & SP Sync Button
+# 8. Live MLB Lineup & SP Sync Button
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Live MLB Lineup & SP Sync")
@@ -432,7 +477,7 @@ if st.session_state.confirmed_pitchers_summary:
             st.markdown(f"- **{team}**: {sp_name} <small>({status_tag})</small>", unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
-# 8. Sidebar Optimization Controls
+# 9. Sidebar Optimization Controls
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Optimization & Stacking Rules")
@@ -458,16 +503,16 @@ num_lineups = st.sidebar.slider("Lineups to Generate", min_value=1, max_value=10
 max_overlap = st.sidebar.slider("Max Player Overlap Between Lineups", min_value=3, max_value=8, value=6, step=1)
 
 # -----------------------------------------------------------------------------
-# 9. Fast PuLP MILP Optimization Core
+# 10. Fast PuLP MILP Optimization Core
 # -----------------------------------------------------------------------------
 def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, block_p_p, max_own, num_lineups_to_gen, max_overlap_val, enforce_starters=True):
     df_raw = df_input.copy()
     
-    # 1. Strictly filter out all inactive, benched, or zero-projection players
+    # 1. Filter out all inactive or zero-projection players
     df_active = df_raw[df_raw["Projection"] > 0].copy().reset_index(drop=True)
     df_active["Position"] = df_active["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
     
-    # 2. Pitcher Filtering: ONLY pitchers with Projection > 0 (and IsConfirmedStarter)
+    # 2. Pitcher Filtering: ONLY 1 SP per team
     pitchers_sub = df_active[df_active["Position"] == "P"].copy()
     if enforce_starters and pitchers_sub["IsConfirmedStarter"].any():
         pitchers_filtered = pitchers_sub[pitchers_sub["IsConfirmedStarter"]].reset_index(drop=True)
@@ -538,7 +583,7 @@ def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, blo
 
         for slot in slots:
             eligible_players = [p_idx for p_idx in range(n_players) if (p_idx, slot) in x]
-            prob += lpSum([x[p_idx, slot] for p_idx in eligible_players]) == 1
+            prob += lpSum([x[p_idx, slot] for slot in eligible_players]) == 1
 
         prob += lpSum([y[p_idx] for p_idx in range(n_players)]) == 10
         prob += lpSum([df_players.loc[p_idx, "Salary"] * y[p_idx] for p_idx in range(n_players)]) <= max_salary
@@ -640,7 +685,7 @@ def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, blo
     return generated_lineups
 
 # -----------------------------------------------------------------------------
-# 10. Interactive Tabs & Results UI
+# 11. Interactive Tabs & Results UI
 # -----------------------------------------------------------------------------
 tab_opt, tab_heat, tab_data = st.tabs(["🚀 Lineup Optimizer", "🔥 Matchup Heatmap", "📋 Slate Data"])
 
@@ -649,10 +694,9 @@ with tab_data:
     st.dataframe(df, use_container_width=True)
 
 with tab_heat:
-    st.subheader("Vegas Implied Runs & Batting Order Heatmap")
+    st.subheader("Vegas Implied Runs & Batting Order Heatmap (All Slate Teams)")
     df_heat = df.copy()
-    if starters_only and "BattingOrder" in df_heat.columns and (df_heat["BattingOrder"] > 0).any():
-        df_heat = df_heat[(df_heat["BattingOrder"].between(1, 9)) | (df_heat["Position"] == "P")]
+    df_heat = df_heat[(df_heat["BattingOrder"].between(1, 9)) | (df_heat["Position"] == "P")]
 
     if not df_heat.empty and "Team" in df_heat.columns and "BattingOrder" in df_heat.columns:
         pivot_proj = df_heat[df_heat["Position"] != "P"].pivot_table(
