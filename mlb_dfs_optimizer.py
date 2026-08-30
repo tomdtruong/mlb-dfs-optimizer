@@ -193,7 +193,7 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
     confirmed_teams_count = 0
     projected_teams_count = 0
 
-    # 1. Pitcher Synchronization & Exclusion
+    # 1. PITCHER SYNCHRONIZATION & HARD EXCLUSION OF BENCH ARMS
     for team in df_out["Team"].unique():
         team_p_mask = (df_out["Team"] == team) & (df_out["Position"].str.contains("P", na=False))
         if not team_p_mask.any():
@@ -206,6 +206,7 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
                 df_out.loc[matched_idx, "IsConfirmedStarter"] = True
                 matched_pitchers_summary.append((team, df_out.loc[matched_idx, "Name"], "Probable SP 🟢"))
                 
+                # Zero out non-starting pitchers on this team
                 non_sp = team_p_mask & (df_out.index != matched_idx)
                 df_out.loc[non_sp, "Projection"] = 0.0
                 df_out.loc[non_sp, "IsConfirmedStarter"] = False
@@ -218,7 +219,7 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
                 non_sp = team_p_mask & (df_out.index != top_sp_idx)
                 df_out.loc[non_sp, "Projection"] = 0.0
 
-    # 2. Hitter Synchronization (Confirmed vs Projected)
+    # 2. HITTER SYNCHRONIZATION (CONFIRMED 🟢 vs PROJECTED 🟡)
     for team in df_out["Team"].unique():
         team_h_mask = (df_out["Team"] == team) & (~df_out["Position"].isin(["P", "SP", "RP"]))
         if not team_h_mask.any():
@@ -365,6 +366,7 @@ def parse_and_clean_dk_slate(file_source):
     df["LineupStatus"] = "PROJECTED 🟡"
     df["IsConfirmedStarter"] = True
     
+    # Run immediate full slate integrity to guarantee all teams have starting 9s
     return ensure_full_slate_integrity(df)
 
 # -----------------------------------------------------------------------------
@@ -581,9 +583,10 @@ def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, blo
             eligible_slots = [slot for slot in slots if (p_idx, slot) in x]
             prob += lpSum([x[p_idx, slot] for slot in eligible_slots]) == y[p_idx]
 
+        # FIXED HERE: [x[p_idx, slot] for p_idx in eligible_players] instead of for slot in eligible_players
         for slot in slots:
             eligible_players = [p_idx for p_idx in range(n_players) if (p_idx, slot) in x]
-            prob += lpSum([x[p_idx, slot] for slot in eligible_players]) == 1
+            prob += lpSum([x[p_idx, slot] for p_idx in eligible_players]) == 1
 
         prob += lpSum([y[p_idx] for p_idx in range(n_players)]) == 10
         prob += lpSum([df_players.loc[p_idx, "Salary"] * y[p_idx] for p_idx in range(n_players)]) <= max_salary
