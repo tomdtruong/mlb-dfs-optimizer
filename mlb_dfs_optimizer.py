@@ -5,12 +5,12 @@ import plotly.express as px
 from pulp import LpMaximize, LpProblem, LpVariable, lpSum, PULP_CBC_CMD, LpStatus
 import urllib.request
 import json
-import datetime
+from datetime import datetime, date
 import re
 import unicodedata
 
 # -----------------------------------------------------------------------------
-# 1. Page Configuration & Layout
+# 1. Page Configuration & Setup
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="DraftKings MLB Single-Entry & GPP Optimizer",
@@ -22,11 +22,11 @@ st.set_page_config(
 st.title("⚾ DraftKings MLB Single-Entry & GPP Optimizer")
 st.markdown("""
 Optimize DraftKings MLB tournament lineups using **0-1 Mixed Integer Linear Programming (MILP)** 
-with **5-3, 5-2, and 4-4 stacking architectures**, **pitcher-hitter anti-correlation**, and **live MLB confirmed lineup synchronization**.
+with **5-3, 5-2, and 4-4 stacking**, **pitcher-hitter anti-correlation**, and **starting lineup / probable pitcher confirmation**.
 """)
 
 # -----------------------------------------------------------------------------
-# 2. Live MLB Stats API Lineup Fetcher & Matcher
+# 2. Helper Functions & Live MLB Stats API Lineup Fetcher
 # -----------------------------------------------------------------------------
 def clean_player_name(name):
     if not isinstance(name, str):
@@ -63,6 +63,18 @@ def match_player_to_dk(name, df_team_players):
         return last_matches[0]
         
     return None
+
+def extract_slate_date_from_df(df):
+    """Extracts date from 'Game Info' column (e.g., ATL@MIL 08/22/2026)."""
+    if "Game Info" in df.columns:
+        for val in df["Game Info"].dropna():
+            match = re.search(r'(\d{2}/\d{2}/\d{4})', str(val))
+            if match:
+                try:
+                    return datetime.strptime(match.group(1), "%m/%d/%Y").date()
+                except:
+                    pass
+    return date.today()
 
 @st.cache_data(ttl=300)
 def fetch_mlb_confirmed_lineups(target_date_str):
@@ -118,101 +130,8 @@ def fetch_mlb_confirmed_lineups(target_date_str):
 
     return confirmed_lineups, probable_pitchers, None
 
-def apply_confirmed_lineups_to_df(df_input, confirmed_lineups, probable_pitchers):
-    """Maps confirmed starting pitchers and batting orders 1-9 onto the active DataFrame."""
-    df_updated = df_input.copy()
-    
-    # Initialize all to BattingOrder = 0 (bench/unconfirmed)
-    df_updated["BattingOrder"] = 0
-    df_updated["IsConfirmedStarter"] = False
-    
-    matched_hitters_count = 0
-    matched_pitchers_count = 0
-
-    # 1. Match Pitchers
-    for team, sp_name in probable_pitchers.items():
-        team_pitchers = df_updated[(df_updated["Team"] == team) & (df_updated["Position"].str.contains("P", na=False))]
-        matched_idx = match_player_to_dk(sp_name, team_pitchers)
-        if matched_idx is not None:
-            df_updated.loc[matched_idx, "IsConfirmedStarter"] = True
-            df_updated.loc[matched_idx, "Position"] = "P"
-            matched_pitchers_count += 1
-
-    # 2. Match Starting 9 Hitters
-    for team, batting_order in confirmed_lineups.items():
-        team_hitters = df_updated[(df_updated["Team"] == team) & (~df_updated["Position"].isin(["P", "SP", "RP"]))]
-        for order_idx, player_name in enumerate(batting_order, 1):
-            matched_idx = match_player_to_dk(player_name, team_hitters)
-            if matched_idx is not None:
-                df_updated.loc[matched_idx, "BattingOrder"] = order_idx
-                df_updated.loc[matched_idx, "IsConfirmedStarter"] = True
-                matched_hitters_count += 1
-
-    return df_updated, matched_hitters_count, matched_pitchers_count
-
 # -----------------------------------------------------------------------------
-# 3. Built-In Sample Slate Generator
-# -----------------------------------------------------------------------------
-def get_sample_slate():
-    """Generates a sample 3-game slate for immediate testing."""
-    data = [
-        # Game 1: NYY @ BOS
-        {"Name": "Gerrit Cole", "Position": "P", "Team": "NYY", "Opponent": "BOS", "Salary": 10200, "Projection": 22.4, "Ownership": 28.5, "BattingOrder": 0, "ImpliedRuns": 4.2},
-        {"Name": "Brayan Bello", "Position": "P", "Team": "BOS", "Opponent": "NYY", "Salary": 7400, "Projection": 14.1, "Ownership": 12.0, "BattingOrder": 0, "ImpliedRuns": 5.3},
-        {"Name": "Anthony Volpe", "Position": "SS", "Team": "NYY", "Opponent": "BOS", "Salary": 4200, "Projection": 8.9, "Ownership": 15.2, "BattingOrder": 1, "ImpliedRuns": 5.3},
-        {"Name": "Juan Soto", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 6100, "Projection": 12.8, "Ownership": 24.1, "BattingOrder": 2, "ImpliedRuns": 5.3},
-        {"Name": "Aaron Judge", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 6400, "Projection": 14.2, "Ownership": 27.5, "BattingOrder": 3, "ImpliedRuns": 5.3},
-        {"Name": "Giancarlo Stanton", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 4800, "Projection": 9.7, "Ownership": 14.8, "BattingOrder": 4, "ImpliedRuns": 5.3},
-        {"Name": "Jazz Chisholm Jr.", "Position": "3B/2B", "Team": "NYY", "Opponent": "BOS", "Salary": 4900, "Projection": 9.4, "Ownership": 16.0, "BattingOrder": 5, "ImpliedRuns": 5.3},
-        {"Name": "Austin Wells", "Position": "C", "Team": "NYY", "Opponent": "BOS", "Salary": 3800, "Projection": 7.8, "Ownership": 11.2, "BattingOrder": 6, "ImpliedRuns": 5.3},
-        {"Name": "Anthony Rizzo", "Position": "1B", "Team": "NYY", "Opponent": "BOS", "Salary": 3500, "Projection": 7.1, "Ownership": 8.4, "BattingOrder": 7, "ImpliedRuns": 5.3},
-        {"Name": "Jarren Duran", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 5300, "Projection": 10.5, "Ownership": 17.3, "BattingOrder": 1, "ImpliedRuns": 4.2},
-        {"Name": "Rafael Devers", "Position": "3B", "Team": "BOS", "Opponent": "NYY", "Salary": 5600, "Projection": 11.2, "Ownership": 19.5, "BattingOrder": 2, "ImpliedRuns": 4.2},
-        {"Name": "Tyler O'Neill", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 4600, "Projection": 9.0, "Ownership": 13.0, "BattingOrder": 3, "ImpliedRuns": 4.2},
-        {"Name": "Triston Casas", "Position": "1B", "Team": "BOS", "Opponent": "NYY", "Salary": 4300, "Projection": 8.5, "Ownership": 10.5, "BattingOrder": 4, "ImpliedRuns": 4.2},
-        {"Name": "Masataka Yoshida", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 3700, "Projection": 7.6, "Ownership": 7.8, "BattingOrder": 5, "ImpliedRuns": 4.2},
-        {"Name": "Connor Wong", "Position": "C", "Team": "BOS", "Opponent": "NYY", "Salary": 3400, "Projection": 6.8, "Ownership": 6.2, "BattingOrder": 6, "ImpliedRuns": 4.2},
-        {"Name": "Ceddanne Rafaela", "Position": "SS/OF", "Team": "BOS", "Opponent": "NYY", "Salary": 3600, "Projection": 7.2, "Ownership": 8.0, "BattingOrder": 7, "ImpliedRuns": 4.2},
-
-        # Game 2: LAD @ COL
-        {"Name": "Yoshinobu Yamamoto", "Position": "P", "Team": "LAD", "Opponent": "COL", "Salary": 9600, "Projection": 19.8, "Ownership": 21.0, "BattingOrder": 0, "ImpliedRuns": 4.5},
-        {"Name": "Kyle Freeland", "Position": "P", "Team": "COL", "Opponent": "LAD", "Salary": 5000, "Projection": 9.2, "Ownership": 4.1, "BattingOrder": 0, "ImpliedRuns": 7.0},
-        {"Name": "Shohei Ohtani", "Position": "OF", "Team": "LAD", "Opponent": "COL", "Salary": 6700, "Projection": 15.8, "Ownership": 34.0, "BattingOrder": 1, "ImpliedRuns": 7.0},
-        {"Name": "Mookie Betts", "Position": "SS/OF", "Team": "LAD", "Opponent": "COL", "Salary": 6200, "Projection": 13.5, "Ownership": 28.0, "BattingOrder": 2, "ImpliedRuns": 7.0},
-        {"Name": "Freddie Freeman", "Position": "1B", "Team": "LAD", "Opponent": "COL", "Salary": 5800, "Projection": 12.6, "Ownership": 23.5, "BattingOrder": 3, "ImpliedRuns": 7.0},
-        {"Name": "Teoscar Hernandez", "Position": "OF", "Team": "LAD", "Opponent": "COL", "Salary": 5100, "Projection": 11.0, "Ownership": 20.2, "BattingOrder": 4, "ImpliedRuns": 7.0},
-        {"Name": "Max Muncy", "Position": "3B", "Team": "LAD", "Opponent": "COL", "Salary": 4700, "Projection": 9.9, "Ownership": 15.4, "BattingOrder": 5, "ImpliedRuns": 7.0},
-        {"Name": "Will Smith", "Position": "C", "Team": "LAD", "Opponent": "COL", "Salary": 5200, "Projection": 10.4, "Ownership": 18.0, "BattingOrder": 6, "ImpliedRuns": 7.0},
-        {"Name": "Gavin Lux", "Position": "2B", "Team": "LAD", "Opponent": "COL", "Salary": 3900, "Projection": 8.1, "Ownership": 11.0, "BattingOrder": 7, "ImpliedRuns": 7.0},
-        {"Name": "Ezequiel Tovar", "Position": "SS", "Team": "COL", "Opponent": "LAD", "Salary": 4400, "Projection": 8.7, "Ownership": 12.1, "BattingOrder": 1, "ImpliedRuns": 4.5},
-        {"Name": "Brenton Doyle", "Position": "OF", "Team": "COL", "Opponent": "LAD", "Salary": 4600, "Projection": 9.1, "Ownership": 14.0, "BattingOrder": 2, "ImpliedRuns": 4.5},
-        {"Name": "Ryan McMahon", "Position": "3B", "Team": "COL", "Opponent": "LAD", "Salary": 4200, "Projection": 8.3, "Ownership": 10.2, "BattingOrder": 3, "ImpliedRuns": 4.5},
-        {"Name": "Michael Toglia", "Position": "1B/OF", "Team": "COL", "Opponent": "LAD", "Salary": 3800, "Projection": 7.9, "Ownership": 9.5, "BattingOrder": 4, "ImpliedRuns": 4.5},
-        {"Name": "Brendan Rodgers", "Position": "2B", "Team": "COL", "Opponent": "LAD", "Salary": 3500, "Projection": 7.0, "Ownership": 6.5, "BattingOrder": 5, "ImpliedRuns": 4.5},
-        {"Name": "Jacob Stallings", "Position": "C", "Team": "COL", "Opponent": "LAD", "Salary": 3100, "Projection": 5.9, "Ownership": 4.2, "BattingOrder": 6, "ImpliedRuns": 4.5},
-
-        # Game 3: PHI @ ATL
-        {"Name": "Zack Wheeler", "Position": "P", "Team": "PHI", "Opponent": "ATL", "Salary": 10000, "Projection": 21.5, "Ownership": 25.0, "BattingOrder": 0, "ImpliedRuns": 3.9},
-        {"Name": "Max Fried", "Position": "P", "Team": "ATL", "Opponent": "PHI", "Salary": 8800, "Projection": 17.2, "Ownership": 16.5, "BattingOrder": 0, "ImpliedRuns": 4.6},
-        {"Name": "Kyle Schwarber", "Position": "OF", "Team": "PHI", "Opponent": "ATL", "Salary": 5700, "Projection": 11.8, "Ownership": 21.0, "BattingOrder": 1, "ImpliedRuns": 4.6},
-        {"Name": "Trea Turner", "Position": "SS", "Team": "PHI", "Opponent": "ATL", "Salary": 5900, "Projection": 12.1, "Ownership": 22.0, "BattingOrder": 2, "ImpliedRuns": 4.6},
-        {"Name": "Bryce Harper", "Position": "1B", "Team": "PHI", "Opponent": "ATL", "Salary": 6000, "Projection": 12.5, "Ownership": 24.0, "BattingOrder": 3, "ImpliedRuns": 4.6},
-        {"Name": "Alec Bohm", "Position": "3B/1B", "Team": "PHI", "Opponent": "ATL", "Salary": 4500, "Projection": 9.1, "Ownership": 13.5, "BattingOrder": 4, "ImpliedRuns": 4.6},
-        {"Name": "Nick Castellanos", "Position": "OF", "Team": "PHI", "Opponent": "ATL", "Salary": 4300, "Projection": 8.6, "Ownership": 11.0, "BattingOrder": 5, "ImpliedRuns": 4.6},
-        {"Name": "J.T. Realmuto", "Position": "C", "Team": "PHI", "Opponent": "ATL", "Salary": 4600, "Projection": 8.9, "Ownership": 12.8, "BattingOrder": 6, "ImpliedRuns": 4.6},
-        {"Name": "Bryson Stott", "Position": "2B/SS", "Team": "PHI", "Opponent": "ATL", "Salary": 3900, "Projection": 7.8, "Ownership": 9.0, "BattingOrder": 7, "ImpliedRuns": 4.6},
-        {"Name": "Michael Harris II", "Position": "OF", "Team": "ATL", "Opponent": "PHI", "Salary": 4500, "Projection": 9.0, "Ownership": 12.0, "BattingOrder": 1, "ImpliedRuns": 3.9},
-        {"Name": "Ozzie Albies", "Position": "2B", "Team": "ATL", "Opponent": "PHI", "Salary": 4800, "Projection": 9.5, "Ownership": 14.5, "BattingOrder": 2, "ImpliedRuns": 3.9},
-        {"Name": "Marcell Ozuna", "Position": "OF", "Team": "ATL", "Opponent": "PHI", "Salary": 5500, "Projection": 11.5, "Ownership": 19.0, "BattingOrder": 3, "ImpliedRuns": 3.9},
-        {"Name": "Matt Olson", "Position": "1B", "Team": "ATL", "Opponent": "PHI", "Salary": 5200, "Projection": 10.8, "Ownership": 16.5, "BattingOrder": 4, "ImpliedRuns": 3.9},
-        {"Name": "Austin Riley", "Position": "3B", "Team": "ATL", "Opponent": "PHI", "Salary": 5000, "Projection": 10.2, "Ownership": 15.0, "BattingOrder": 5, "ImpliedRuns": 3.9},
-        {"Name": "Sean Murphy", "Position": "C", "Team": "ATL", "Opponent": "PHI", "Salary": 4000, "Projection": 8.0, "Ownership": 9.5, "BattingOrder": 6, "ImpliedRuns": 3.9},
-        {"Name": "Orlando Arcia", "Position": "SS", "Team": "ATL", "Opponent": "PHI", "Salary": 3200, "Projection": 6.2, "Ownership": 5.0, "BattingOrder": 7, "ImpliedRuns": 3.9},
-    ]
-    return pd.DataFrame(data)
-
-# -----------------------------------------------------------------------------
-# 4. CSV Slate Ingestion & Automatic Cleaning
+# 3. CSV Ingestion & Standardization Parser
 # -----------------------------------------------------------------------------
 def parse_and_clean_dk_slate(file_source):
     """Robust parser that ingests raw or cleaned DraftKings MLB CSVs."""
@@ -332,11 +251,55 @@ def parse_and_clean_dk_slate(file_source):
 
     return df
 
+# -----------------------------------------------------------------------------
+# 4. Built-In Sample Slate
+# -----------------------------------------------------------------------------
+def get_sample_slate():
+    data = [
+        {"Name": "Gerrit Cole", "Position": "P", "Team": "NYY", "Opponent": "BOS", "Salary": 10200, "Projection": 22.4, "Ownership": 28.5, "BattingOrder": 0, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Brayan Bello", "Position": "P", "Team": "BOS", "Opponent": "NYY", "Salary": 7400, "Projection": 14.1, "Ownership": 12.0, "BattingOrder": 0, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Anthony Volpe", "Position": "SS", "Team": "NYY", "Opponent": "BOS", "Salary": 4200, "Projection": 8.9, "Ownership": 15.2, "BattingOrder": 1, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Juan Soto", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 6100, "Projection": 12.8, "Ownership": 24.1, "BattingOrder": 2, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Aaron Judge", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 6400, "Projection": 14.2, "Ownership": 27.5, "BattingOrder": 3, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Giancarlo Stanton", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 4800, "Projection": 9.7, "Ownership": 14.8, "BattingOrder": 4, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Jazz Chisholm Jr.", "Position": "3B/2B", "Team": "NYY", "Opponent": "BOS", "Salary": 4900, "Projection": 9.4, "Ownership": 16.0, "BattingOrder": 5, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Austin Wells", "Position": "C", "Team": "NYY", "Opponent": "BOS", "Salary": 3800, "Projection": 7.8, "Ownership": 11.2, "BattingOrder": 6, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Anthony Rizzo", "Position": "1B", "Team": "NYY", "Opponent": "BOS", "Salary": 3500, "Projection": 7.1, "Ownership": 8.4, "BattingOrder": 7, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Jarren Duran", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 5300, "Projection": 10.5, "Ownership": 17.3, "BattingOrder": 1, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Rafael Devers", "Position": "3B", "Team": "BOS", "Opponent": "NYY", "Salary": 5600, "Projection": 11.2, "Ownership": 19.5, "BattingOrder": 2, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Tyler O'Neill", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 4600, "Projection": 9.0, "Ownership": 13.0, "BattingOrder": 3, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Triston Casas", "Position": "1B", "Team": "BOS", "Opponent": "NYY", "Salary": 4300, "Projection": 8.5, "Ownership": 10.5, "BattingOrder": 4, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Masataka Yoshida", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 3700, "Projection": 7.6, "Ownership": 7.8, "BattingOrder": 5, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Connor Wong", "Position": "C", "Team": "BOS", "Opponent": "NYY", "Salary": 3400, "Projection": 6.8, "Ownership": 6.2, "BattingOrder": 6, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Ceddanne Rafaela", "Position": "SS/OF", "Team": "BOS", "Opponent": "NYY", "Salary": 3600, "Projection": 7.2, "Ownership": 8.0, "BattingOrder": 7, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Yoshinobu Yamamoto", "Position": "P", "Team": "LAD", "Opponent": "COL", "Salary": 9600, "Projection": 19.8, "Ownership": 21.0, "BattingOrder": 0, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Kyle Freeland", "Position": "P", "Team": "COL", "Opponent": "LAD", "Salary": 5000, "Projection": 9.2, "Ownership": 4.1, "BattingOrder": 0, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Shohei Ohtani", "Position": "OF", "Team": "LAD", "Opponent": "COL", "Salary": 6700, "Projection": 15.8, "Ownership": 34.0, "BattingOrder": 1, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Mookie Betts", "Position": "SS/OF", "Team": "LAD", "Opponent": "COL", "Salary": 6200, "Projection": 13.5, "Ownership": 28.0, "BattingOrder": 2, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Freddie Freeman", "Position": "1B", "Team": "LAD", "Opponent": "COL", "Salary": 5800, "Projection": 12.6, "Ownership": 23.5, "BattingOrder": 3, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Teoscar Hernandez", "Position": "OF", "Team": "LAD", "Opponent": "COL", "Salary": 5100, "Projection": 11.0, "Ownership": 20.2, "BattingOrder": 4, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Max Muncy", "Position": "3B", "Team": "LAD", "Opponent": "COL", "Salary": 4700, "Projection": 9.9, "Ownership": 15.4, "BattingOrder": 5, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Will Smith", "Position": "C", "Team": "LAD", "Opponent": "COL", "Salary": 5200, "Projection": 10.4, "Ownership": 18.0, "BattingOrder": 6, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Gavin Lux", "Position": "2B", "Team": "LAD", "Opponent": "COL", "Salary": 3900, "Projection": 8.1, "Ownership": 11.0, "BattingOrder": 7, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Ezequiel Tovar", "Position": "SS", "Team": "COL", "Opponent": "LAD", "Salary": 4400, "Projection": 8.7, "Ownership": 12.1, "BattingOrder": 1, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Brenton Doyle", "Position": "OF", "Team": "COL", "Opponent": "LAD", "Salary": 4600, "Projection": 9.1, "Ownership": 14.0, "BattingOrder": 2, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Ryan McMahon", "Position": "3B", "Team": "COL", "Opponent": "LAD", "Salary": 4200, "Projection": 8.3, "Ownership": 10.2, "BattingOrder": 3, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Michael Toglia", "Position": "1B/OF", "Team": "COL", "Opponent": "LAD", "Salary": 3800, "Projection": 7.9, "Ownership": 9.5, "BattingOrder": 4, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Brendan Rodgers", "Position": "2B", "Team": "COL", "Opponent": "LAD", "Salary": 3500, "Projection": 7.0, "Ownership": 6.5, "BattingOrder": 5, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Jacob Stallings", "Position": "C", "Team": "COL", "Opponent": "LAD", "Salary": 3100, "Projection": 5.9, "Ownership": 4.2, "BattingOrder": 6, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"}
+    ]
+    return pd.DataFrame(data)
+
+# -----------------------------------------------------------------------------
+# 5. Sidebar Ingestion & State Management
+# -----------------------------------------------------------------------------
 st.sidebar.header("📁 Slate Ingestion")
 data_mode = st.sidebar.radio("Data Source", ["Use Sample Slate (3 Games)", "Upload DraftKings CSV"])
 
 if "mlb_df" not in st.session_state:
     st.session_state.mlb_df = get_sample_slate()
+if "confirmed_sp_map" not in st.session_state:
+    st.session_state.confirmed_sp_map = {}
 
 if data_mode == "Upload DraftKings CSV":
     uploaded_file = st.sidebar.file_uploader("Upload DK Slate CSV", type=["csv"])
@@ -351,31 +314,96 @@ else:
     if len(st.session_state.mlb_df) > 50:
         st.session_state.mlb_df = get_sample_slate()
 
+df = st.session_state.mlb_df
+
+# Auto-detect slate date from CSV Game Info
+detected_date = extract_slate_date_from_df(df)
+
 # -----------------------------------------------------------------------------
-# 5. Live MLB API Lineup Sync UI
+# 6. Live MLB Lineup Sync UI
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
-st.sidebar.header("🔄 Live MLB Lineup Synchronization")
-selected_date = st.sidebar.date_input("Slate Date", datetime.date.today())
+st.sidebar.header("🔄 Live MLB Lineup & SP Sync")
+selected_date = st.sidebar.date_input("Slate Date", detected_date)
 
 if st.sidebar.button("⚡ Sync Confirmed MLB Lineups & SPs", type="secondary", use_container_width=True):
-    with st.spinner("Connecting to MLB Stats API..."):
+    with st.spinner(f"Fetching MLB official starting cards for {selected_date}..."):
         date_str = selected_date.strftime("%Y-%m-%d")
         c_lineups, p_pitchers, err = fetch_mlb_confirmed_lineups(date_str)
         
         if err:
             st.sidebar.error(err)
         elif not c_lineups and not p_pitchers:
-            st.sidebar.warning(f"No confirmed lineups posted for {date_str} yet.")
+            st.sidebar.warning(f"No starting lineups posted for {date_str} yet.")
         else:
-            updated_df, n_hitters, n_pitchers = apply_confirmed_lineups_to_df(st.session_state.mlb_df, c_lineups, p_pitchers)
-            st.session_state.mlb_df = updated_df
-            st.sidebar.success(f"✅ Synced! Confirmed {n_hitters} Starting Hitters and {n_pitchers} Starting Pitchers.")
+            # Update confirmed SP map
+            for team, sp_name in p_pitchers.items():
+                st.session_state.confirmed_sp_map[team] = sp_name
+                
+            # Apply to DataFrame
+            df_updated = df.copy()
+            n_hitters = 0
+            n_pitchers = 0
+            
+            for team, batting_order in c_lineups.items():
+                t_hitters = df_updated[(df_updated["Team"] == team) & (~df_updated["Position"].isin(["P", "SP", "RP"]))]
+                for order_idx, player_name in enumerate(batting_order, 1):
+                    matched_idx = match_player_to_dk(player_name, t_hitters)
+                    if matched_idx is not None:
+                        df_updated.loc[matched_idx, "BattingOrder"] = order_idx
+                        n_hitters += 1
+                        
+            for team, sp_name in p_pitchers.items():
+                t_pitchers = df_updated[(df_updated["Team"] == team) & (df_updated["Position"].str.contains("P", na=False))]
+                matched_idx = match_player_to_dk(sp_name, t_pitchers)
+                if matched_idx is not None:
+                    df_updated.loc[matched_idx, "Position"] = "P"
+                    n_pitchers += 1
 
-df = st.session_state.mlb_df
+            st.session_state.mlb_df = df_updated
+            st.sidebar.success(f"✅ Synced! Found {n_hitters} Starting Hitters & {n_pitchers} Starting Pitchers.")
 
 # -----------------------------------------------------------------------------
-# 6. Sidebar Optimization Controls
+# 7. Interactive Starting Pitcher Confirmation Manager
+# -----------------------------------------------------------------------------
+st.sidebar.markdown("---")
+with st.sidebar.expander("🎯 Confirmed Starting Pitchers (Verify / Override)", expanded=True):
+    st.markdown("<small>Select the confirmed Starting Pitcher for each team. All other pitchers will be automatically excluded.</small>", unsafe_allow_html=True)
+    
+    unique_teams = sorted(df["Team"].unique().tolist())
+    active_sp_selection = {}
+    
+    for team in unique_teams:
+        team_pitchers = df[(df["Team"] == team) & (df["Position"].str.contains("P", na=False))]
+        if not team_pitchers.empty:
+            pitcher_options = team_pitchers["Name"].tolist()
+            
+            # Default selection: check synced SP or fallback to highest projected
+            default_index = 0
+            synced_sp = st.session_state.confirmed_sp_map.get(team)
+            if synced_sp:
+                matched_idx = match_player_to_dk(synced_sp, team_pitchers)
+                if matched_idx is not None:
+                    sp_name = team_pitchers.loc[matched_idx, "Name"]
+                    if sp_name in pitcher_options:
+                        default_index = pitcher_options.index(sp_name)
+            else:
+                top_p = team_pitchers.sort_values(by=["Projection", "Salary"], ascending=[False, False])
+                if not top_p.empty:
+                    top_name = top_p.iloc[0]["Name"]
+                    if top_name in pitcher_options:
+                        default_index = pitcher_options.index(top_name)
+                        
+            chosen_sp = st.selectbox(
+                f"**{team} Starting Pitcher:**", 
+                options=pitcher_options, 
+                index=default_index, 
+                key=f"sp_select_{team}"
+            )
+            active_sp_selection[team] = chosen_sp
+
+# -----------------------------------------------------------------------------
+# 8. Sidebar Optimization Controls
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Optimization & Stacking Rules")
@@ -409,28 +437,30 @@ num_lineups = st.sidebar.slider("Lineups to Generate", min_value=1, max_value=10
 max_overlap = st.sidebar.slider("Max Player Overlap Between Lineups", min_value=3, max_value=8, value=6, step=1)
 
 # -----------------------------------------------------------------------------
-# 7. Robust MILP Optimization Core
+# 9. Fast PuLP MILP Optimization Core
 # -----------------------------------------------------------------------------
-def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, block_p_p, max_own, num_lineups_to_gen, max_overlap_val, enforce_starters=True):
+def optimize_dk_mlb(df_input, sp_selection_dict, stack_type, min_salary, max_salary, block_p_h, block_p_p, max_own, num_lineups_to_gen, max_overlap_val, enforce_starters=True):
     df_raw = df_input.copy()
     
     # 1. Filter out inactive / 0-projection players
     df_active = df_raw[df_raw["Projection"] > 0].copy().reset_index(drop=True)
     df_active["Position"] = df_active["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
     
-    # 2. Strict Starters Filtering
+    # 2. Strict Pitcher Pool: STRICTLY ONLY THE 1 SELECTED SP PER TEAM
     pitchers_list = []
-    for t in df_active["Team"].unique():
-        t_p = df_active[(df_active["Team"] == t) & (df_active["Position"] == "P")]
-        if "IsConfirmedStarter" in t_p.columns and t_p["IsConfirmedStarter"].any():
-            pitchers_list.append(t_p[t_p["IsConfirmedStarter"]].head(1))
+    df_pitcher_sub = df_active[df_active["Position"] == "P"].copy()
+    for team, sp_name in sp_selection_dict.items():
+        matched_sp = df_pitcher_sub[(df_pitcher_sub["Team"] == team) & (df_pitcher_sub["Name"] == sp_name)]
+        if not matched_sp.empty:
+            pitchers_list.append(matched_sp.head(1))
         else:
-            t_p_sorted = t_p.sort_values(by=["Projection", "Salary"], ascending=[False, False])
-            if not t_p_sorted.empty:
-                pitchers_list.append(t_p_sorted.head(1))
-            
+            matched_sp = df_pitcher_sub[(df_pitcher_sub["Team"] == team) & (df_pitcher_sub["Name"].str.contains(sp_name.split()[-1], case=False))]
+            if not matched_sp.empty:
+                pitchers_list.append(matched_sp.head(1))
+                
     pitchers_filtered = pd.concat(pitchers_list).reset_index(drop=True) if pitchers_list else pd.DataFrame()
 
+    # 3. Hitters Pool: Batting Orders 1-9
     hitters_list = []
     for t in df_active["Team"].unique():
         t_h = df_active[(df_active["Team"] == t) & (df_active["Position"] != "P")]
@@ -550,7 +580,7 @@ def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, blo
                 t_hitters = [p_idx for p_idx in hitter_indices if df_players.loc[p_idx, "Team"] == t]
                 prob += lpSum([y[p_idx] for p_idx in t_hitters]) <= 5
 
-        # Diversity Constraint
+        # Lineup Overlap Constraint
         for prev_set in previous_lineup_sets:
             prob += lpSum([y[p_idx] for p_idx in prev_set]) <= max_overlap_val
 
@@ -589,7 +619,7 @@ def optimize_dk_mlb(df_input, stack_type, min_salary, max_salary, block_p_h, blo
     return generated_lineups
 
 # -----------------------------------------------------------------------------
-# 8. Interactive UI & Results Display
+# 10. Interactive Tabs & Results UI
 # -----------------------------------------------------------------------------
 tab_opt, tab_heat, tab_data = st.tabs(["🚀 Lineup Optimizer", "🔥 Matchup Heatmap", "📋 Slate Data"])
 
@@ -624,6 +654,7 @@ with tab_opt:
         with st.spinner("Solving Linear Program..."):
             lineups = optimize_dk_mlb(
                 df,
+                sp_selection_dict=active_sp_selection,
                 stack_type=stack_strategy,
                 min_salary=min_sal,
                 max_salary=max_sal,
