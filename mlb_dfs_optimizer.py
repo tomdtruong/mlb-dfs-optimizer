@@ -23,7 +23,7 @@ st.set_page_config(
 st.title("⚾ DraftKings MLB Single-Entry & GPP Optimizer")
 st.markdown("""
 Optimize DraftKings MLB tournament lineups using **0-1 Mixed Integer Linear Programming (MILP)** 
-with **5-3, 5-2, and 4-4 stacking architectures**, **pitcher-hitter anti-correlation**, and **two-tier confirmed/projected starting lineup sync**.
+with **5-3, 5-2, and 4-4 stacking architectures**, **pitcher-hitter anti-correlation**, **matchup filters (Aces vs. Favorable SPs)**, and **two-tier confirmed/projected starting lineup sync**.
 """)
 
 
@@ -145,7 +145,44 @@ def ensure_full_slate_integrity(df_input):
 
 
 # -----------------------------------------------------------------------------
-# 4. Live MLB Stats API Two-Tier Lineup Sync Engine
+# 4. Matchup Adjustment Function
+# -----------------------------------------------------------------------------
+def apply_dynamic_matchup_adjustments(df_input):
+  """Adjusts hitter projections based on Vegas Implied Totals and Opposing SP Quality."""
+  df_adj = df_input.copy()
+
+  sp_rows = df_adj[(df_adj["Position"] == "P") & (df_adj["Projection"] > 0)]
+  sp_salary_map = {}
+  for _, row in sp_rows.iterrows():
+    sp_salary_map[row["Team"]] = row["Salary"]
+
+  for idx, row in df_adj.iterrows():
+    if row["Position"] != "P" and row["Projection"] > 0:
+      opp_team = row.get("Opponent", "")
+      implied_runs = row.get("ImpliedRuns", 4.5)
+
+      # 1. Vegas Factor
+      vegas_mult = np.clip(implied_runs / 4.5, 0.80, 1.25)
+
+      # 2. Opposing SP Suppression / Boost
+      opp_sp_sal = sp_salary_map.get(opp_team, 7500)
+      if opp_sp_sal >= 9500:
+        sp_mult = 0.85  # Ace matchup (-15%)
+      elif opp_sp_sal >= 8000:
+        sp_mult = 0.93  # Above avg (-7%)
+      elif opp_sp_sal <= 6500:
+        sp_mult = 1.10  # Vulnerable pitcher (+10%)
+      else:
+        sp_mult = 1.00  # Average matchup
+
+      base_p = row.get("OriginalProjection", row["Projection"])
+      df_adj.loc[idx, "Projection"] = round(base_p * vegas_mult * sp_mult, 2)
+
+  return df_adj
+
+
+# -----------------------------------------------------------------------------
+# 5. Live MLB Stats API Two-Tier Lineup Sync Engine
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_mlb_confirmed_lineups(target_date_str):
@@ -245,7 +282,7 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
   confirmed_teams_count = 0
   projected_teams_count = 0
 
-  # 1. Pitcher Sync
+  # 1. Pitcher Synchronization & Exclusion
   for team in df_out["Team"].unique():
     team_p_mask = (df_out["Team"] == team) & (
         df_out["Position"].str.contains("P", na=False)
@@ -278,7 +315,7 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
         non_sp = team_p_mask & (df_out.index != top_sp_idx)
         df_out.loc[non_sp, "Projection"] = 0.0
 
-  # 2. Hitter Sync
+  # 2. Hitter Synchronization (Confirmed vs Projected)
   for team in df_out["Team"].unique():
     team_h_mask = (df_out["Team"] == team) & (
         ~df_out["Position"].isin(["P", "SP", "RP"])
@@ -327,7 +364,7 @@ def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
 
 
 # -----------------------------------------------------------------------------
-# 5. CSV Ingestion & Parser
+# 6. CSV Ingestion & Parser
 # -----------------------------------------------------------------------------
 def parse_and_clean_dk_slate(file_source):
   try:
@@ -471,7 +508,7 @@ def parse_and_clean_dk_slate(file_source):
 
 
 # -----------------------------------------------------------------------------
-# 6. Built-In Sample Slate
+# 7. Built-In Sample Slate
 # -----------------------------------------------------------------------------
 def get_sample_slate():
   data = [
@@ -856,7 +893,7 @@ def get_sample_slate():
 
 
 # -----------------------------------------------------------------------------
-# 7. Session State & Slate Ingestion
+# 8. Session State & Slate Ingestion
 # -----------------------------------------------------------------------------
 if "mlb_df" not in st.session_state:
   st.session_state.mlb_df = get_sample_slate()
@@ -896,7 +933,7 @@ df = st.session_state.mlb_df
 detected_date = extract_slate_date_from_df(df)
 
 # -----------------------------------------------------------------------------
-# 8. Live MLB Lineup & SP Sync Button
+# 9. Live MLB Lineup & SP Sync Button
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("🔄 Live MLB Lineup & SP Sync")
@@ -939,7 +976,7 @@ if st.session_state.confirmed_pitchers_summary:
       )
 
 # -----------------------------------------------------------------------------
-# 9. Sidebar Optimization Controls
+# 10. Sidebar Optimization & Matchup Controls
 # -----------------------------------------------------------------------------
 st.sidebar.markdown("---")
 st.sidebar.header("⚙️ Optimization & Stacking Rules")
@@ -983,6 +1020,41 @@ starters_only = st.sidebar.checkbox(
     "Strict Starters Only (Active Lineups & Depth Charts Only)", value=True
 )
 
+# Matchup Conditioning Rules
+st.sidebar.markdown("---")
+st.sidebar.header("⚔️ Matchup Conditioning & Ace Filters")
+
+use_matchup_projections = st.sidebar.checkbox(
+    "Apply Dynamic Matchup Multipliers (Vegas + SP Tier)", value=True
+)
+
+limit_bats_vs_aces = st.sidebar.checkbox(
+    "Limit Hitters vs Elite Pitchers (Aces)", value=True
+)
+ace_threshold = st.sidebar.number_input(
+    "Elite Pitcher Salary Threshold ($)",
+    value=9500,
+    min_value=7000,
+    max_value=13000,
+    step=100,
+)
+max_bats_vs_ace_val = st.sidebar.selectbox(
+    "Max Hitters Allowed vs Elite Pitchers", [0, 1, 2], index=1
+)
+
+target_favorable_sps = st.sidebar.checkbox(
+    "Target Stacks vs Vulnerable Pitchers", value=False
+)
+favorable_sp_threshold = st.sidebar.number_input(
+    "Vulnerable Pitcher Salary Threshold ($)",
+    value=7200,
+    min_value=5000,
+    max_value=9000,
+    step=100,
+)
+
+st.sidebar.markdown("---")
+st.sidebar.header("🎲 Tournament Diversity & Ownership")
 max_roster_own = st.sidebar.slider(
     "Max Cumulative Ownership (%)",
     min_value=80.0,
@@ -1003,7 +1075,7 @@ max_overlap = st.sidebar.slider(
 
 
 # -----------------------------------------------------------------------------
-# 10. Fast PuLP MILP Optimization Core
+# 11. Fast PuLP MILP Optimization Core
 # -----------------------------------------------------------------------------
 def optimize_dk_mlb(
     df_input,
@@ -1012,6 +1084,12 @@ def optimize_dk_mlb(
     max_salary,
     block_p_h,
     block_p_p,
+    apply_matchup_boost,
+    limit_aces,
+    ace_sal_cutoff,
+    max_bats_vs_ace,
+    target_favorable,
+    fav_sp_cutoff,
     max_own,
     num_lineups_to_gen,
     max_overlap_val,
@@ -1019,11 +1097,17 @@ def optimize_dk_mlb(
 ):
   df_raw = df_input.copy()
 
+  # 1. Apply dynamic matchup multiplier adjustments if checked
+  if apply_matchup_boost:
+    df_raw = apply_dynamic_matchup_adjustments(df_raw)
+
+  # 2. Filter out all inactive or zero-projection players
   df_active = df_raw[df_raw["Projection"] > 0].copy().reset_index(drop=True)
   df_active["Position"] = (
       df_active["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
   )
 
+  # 3. Pitcher Filtering: ONLY 1 SP per team
   pitchers_sub = df_active[df_active["Position"] == "P"].copy()
   if enforce_starters and pitchers_sub["IsConfirmedStarter"].any():
     pitchers_filtered = pitchers_sub[
@@ -1041,6 +1125,7 @@ def optimize_dk_mlb(
         pd.concat(p_list).reset_index(drop=True) if p_list else pd.DataFrame()
     )
 
+  # 4. Hitters Filtering: ONLY Batting Orders 1-9 (Confirmed or Projected)
   hitters_sub = df_active[df_active["Position"] != "P"].copy()
   hitters_list = []
   for t in hitters_sub["Team"].unique():
@@ -1179,12 +1264,43 @@ def optimize_dk_mlb(
           ):
             prob += y[p1] + y[p2] <= 1
 
+    # MATCHUP RULE 1: Limit Hitters vs Elite Pitchers (Aces)
+    if limit_aces:
+      for p_idx in pitcher_indices:
+        if df_players.loc[p_idx, "Salary"] >= ace_sal_cutoff:
+          p_opp = df_players.loc[p_idx, "Opponent"]
+          opp_hitters = [
+              h_idx
+              for h_idx in hitter_indices
+              if df_players.loc[h_idx, "Team"] == p_opp
+          ]
+          if opp_hitters:
+            prob += lpSum([y[h_idx] for h_idx in opp_hitters]) <= max_bats_vs_ace
+
     # Team Stacking Logic
     if stack_type != "Unconstrained (No Stacking)":
       primary_indicators = {
           t: LpVariable(f"prim_{t}", cat="Binary") for t in teams
       }
-      prob += lpSum([primary_indicators[t] for t in teams]) == 1
+
+      # MATCHUP RULE 2: Force Primary Stack against Vulnerable SPs
+      if target_favorable:
+        favorable_stack_teams = []
+        for t in teams:
+          opp_sp = df_players[
+              (df_players["Position"] == "P") & (df_players["Opponent"] == t)
+          ]
+          if not opp_sp.empty and opp_sp.iloc[0]["Salary"] <= fav_sp_cutoff:
+            favorable_stack_teams.append(t)
+
+        if favorable_stack_teams:
+          prob += (
+              lpSum([primary_indicators[t] for t in favorable_stack_teams]) == 1
+          )
+        else:
+          prob += lpSum([primary_indicators[t] for t in teams]) == 1
+      else:
+        prob += lpSum([primary_indicators[t] for t in teams]) == 1
 
       if stack_type == "5-3 Stack (Primary + Secondary)":
         sec_indicators = {t: LpVariable(f"sec_{t}", cat="Binary") for t in teams}
@@ -1319,7 +1435,7 @@ def optimize_dk_mlb(
 
 
 # -----------------------------------------------------------------------------
-# 11. Interactive Tabs & Results UI
+# 12. Interactive Tabs & Results UI
 # -----------------------------------------------------------------------------
 tab_opt, tab_heat, tab_data = st.tabs(
     ["🚀 Lineup Optimizer", "🔥 Matchup Heatmap & Slate Schedule", "📋 Slate Data"]
@@ -1428,7 +1544,7 @@ with tab_opt:
   if st.button(
       "⚡ Solve & Optimize Lineups", type="primary", use_container_width=True
   ):
-    with st.spinner("Solving Linear Program..."):
+    with st.spinner("Solving Linear Program with Matchup Constraints..."):
       lineups = optimize_dk_mlb(
           df,
           stack_type=stack_strategy,
@@ -1436,6 +1552,12 @@ with tab_opt:
           max_salary=max_sal,
           block_p_h=no_pitcher_vs_hitter,
           block_p_p=no_opposing_pitchers,
+          apply_matchup_boost=use_matchup_projections,
+          limit_aces=limit_bats_vs_aces,
+          ace_sal_cutoff=ace_threshold,
+          max_bats_vs_ace=max_bats_vs_ace_val,
+          target_favorable=target_favorable_sps,
+          fav_sp_cutoff=favorable_sp_threshold,
           max_own=max_roster_own,
           num_lineups_to_gen=num_lineups,
           max_overlap_val=max_overlap,
