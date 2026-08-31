@@ -1,14 +1,13 @@
-import datetime
-from datetime import date, datetime
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from pulp import LpMaximize, LpProblem, LpVariable, lpSum, PULP_CBC_CMD, LpStatus
+import urllib.request
 import json
+from datetime import datetime, date
 import re
 import unicodedata
-import urllib.request
-import numpy as np
-import pandas as pd
-import plotly.express as px
-from pulp import PULP_CBC_CMD, LpMaximize, LpProblem, LpStatus, LpVariable, lpSum
-import streamlit as st
 
 # -----------------------------------------------------------------------------
 # 1. Page Configuration & Layout
@@ -17,7 +16,7 @@ st.set_page_config(
     page_title="DraftKings MLB Single-Entry & GPP Optimizer",
     page_icon="⚾",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="expanded"
 )
 
 st.title("⚾ DraftKings MLB Single-Entry & GPP Optimizer")
@@ -26,908 +25,473 @@ Optimize DraftKings MLB tournament lineups using **0-1 Mixed Integer Linear Prog
 with **5-3, 5-2, and 4-4 stacking architectures**, **pitcher-hitter anti-correlation**, **matchup filters (Aces vs. Favorable SPs)**, and **two-tier confirmed/projected starting lineup sync**.
 """)
 
-
 # -----------------------------------------------------------------------------
 # 2. Name Cleaning & Matching Helpers
 # -----------------------------------------------------------------------------
 def clean_player_name(name):
-  if not isinstance(name, str):
-    return ""
-  n = unicodedata.normalize("NFKD", name).encode("ASCII", "ignore").decode("utf-8")
-  n = re.sub(r"\b(jr\.?|sr\.?|ii|iii|iv)\b", "", n, flags=re.IGNORECASE)
-  n = re.sub(r"[^a-zA-Z\s]", "", n)
-  return " ".join(n.lower().split())
-
+    if not isinstance(name, str):
+        return ""
+    n = unicodedata.normalize('NFKD', name).encode('ASCII', 'ignore').decode('utf-8')
+    n = re.sub(r'\b(jr\.?|sr\.?|ii|iii|iv)\b', '', n, flags=re.IGNORECASE)
+    n = re.sub(r'[^a-zA-Z\s]', '', n)
+    return " ".join(n.lower().split())
 
 def match_player_to_dk(name, df_team_players):
-  c_name = clean_player_name(name)
-  last_name = c_name.split()[-1] if c_name else ""
-  first_name = c_name.split()[0] if c_name else ""
-
-  for idx, row in df_team_players.iterrows():
-    dk_c = clean_player_name(row["Name"])
-    if c_name == dk_c:
-      return idx
-
-  for idx, row in df_team_players.iterrows():
-    dk_c = clean_player_name(row["Name"])
-    if last_name and last_name in dk_c and first_name and first_name in dk_c:
-      return idx
-
-  last_matches = []
-  for idx, row in df_team_players.iterrows():
-    dk_c = clean_player_name(row["Name"])
-    if last_name and dk_c.split()[-1] == last_name:
-      last_matches.append(idx)
-  if len(last_matches) == 1:
-    return last_matches[0]
-
-  return None
-
+    c_name = clean_player_name(name)
+    last_name = c_name.split()[-1] if c_name else ""
+    first_name = c_name.split()[0] if c_name else ""
+    
+    # 1. Exact match
+    for idx, row in df_team_players.iterrows():
+        dk_c = clean_player_name(row['Name'])
+        if c_name == dk_c:
+            return idx
+            
+    # 2. First + Last name containment
+    for idx, row in df_team_players.iterrows():
+        dk_c = clean_player_name(row['Name'])
+        if last_name and last_name in dk_c and first_name and first_name in dk_c:
+            return idx
+            
+    # 3. Unique last name match
+    last_matches = []
+    for idx, row in df_team_players.iterrows():
+        dk_c = clean_player_name(row['Name'])
+        if last_name and dk_c.split()[-1] == last_name:
+            last_matches.append(idx)
+    if len(last_matches) == 1:
+        return last_matches[0]
+        
+    return None
 
 def extract_slate_date_from_df(df):
-  if "Game Info" in df.columns:
-    for val in df["Game Info"].dropna():
-      match = re.search(r"(\d{2}/\d{2}/\d{4})", str(val))
-      if match:
-        try:
-          return datetime.strptime(match.group(1), "%m/%d/%Y").date()
-        except:
-          pass
-  return date.today()
-
+    if "Game Info" in df.columns:
+        for val in df["Game Info"].dropna():
+            match = re.search(r'(\d{2}/\d{2}/\d{4})', str(val))
+            if match:
+                try:
+                    return datetime.strptime(match.group(1), "%m/%d/%Y").date()
+                except:
+                    pass
+    return date.today()
 
 # -----------------------------------------------------------------------------
 # 3. Slate Integrity & Full Slate Normalizer
 # -----------------------------------------------------------------------------
 def ensure_full_slate_integrity(df_input):
-  df_out = df_input.copy()
+    """
+    Guarantees EVERY team in the uploaded slate has 9 active starting hitters (Orders 1-9)
+    and exactly 1 starting pitcher, preventing late games from being excluded.
+    """
+    df_out = df_input.copy()
+    
+    # Impute missing or zero projections with salary-based baseline floor
+    is_p = df_out["Position"].str.contains("P", na=False)
+    sal_hitter_proj = np.round(np.clip(df_out["Salary"] / 1000.0 * 2.0, 4.0, 15.0), 1)
+    sal_pitcher_proj = np.round(np.clip(df_out["Salary"] / 1000.0 * 2.2, 10.0, 28.0), 1)
+    
+    df_out.loc[is_p & (df_out["Projection"] <= 0), "Projection"] = sal_pitcher_proj[is_p & (df_out["Projection"] <= 0)]
+    df_out.loc[(~is_p) & (df_out["Projection"] <= 0), "Projection"] = sal_hitter_proj[(~is_p) & (df_out["Projection"] <= 0)]
 
-  is_p = df_out["Position"].str.contains("P", na=False)
-  sal_hitter_proj = np.round(
-      np.clip(df_out["Salary"] / 1000.0 * 2.0, 4.0, 15.0), 1
-  )
-  sal_pitcher_proj = np.round(
-      np.clip(df_out["Salary"] / 1000.0 * 2.2, 10.0, 28.0), 1
-  )
+    if "OriginalProjection" not in df_out.columns:
+        df_out["OriginalProjection"] = df_out["Projection"].copy()
+    if "LineupStatus" not in df_out.columns:
+        df_out["LineupStatus"] = "PROJECTED 🟡"
+    if "IsConfirmedStarter" not in df_out.columns:
+        df_out["IsConfirmedStarter"] = False
 
-  df_out.loc[is_p & (df_out["Projection"] <= 0), "Projection"] = (
-      sal_pitcher_proj[is_p & (df_out["Projection"] <= 0)]
-  )
-  df_out.loc[(~is_p) & (df_out["Projection"] <= 0), "Projection"] = (
-      sal_hitter_proj[(~is_p) & (df_out["Projection"] <= 0)]
-  )
+    for team in df_out["Team"].unique():
+        # Hitters
+        team_h_mask = (df_out["Team"] == team) & (~df_out["Position"].isin(["P", "SP", "RP"]))
+        team_hitters = df_out[team_h_mask]
+        
+        has_full_order = (team_hitters["BattingOrder"].between(1, 9)).sum() >= 9
+        if not has_full_order and not team_hitters.empty:
+            top_9_idx = team_hitters.sort_values(by=["Projection", "Salary"], ascending=[False, False]).index[:9]
+            for rank, idx in enumerate(top_9_idx, 1):
+                df_out.loc[idx, "BattingOrder"] = rank
+                df_out.loc[idx, "IsConfirmedStarter"] = True
+                if df_out.loc[idx, "LineupStatus"] != "CONFIRMED 🟢":
+                    df_out.loc[idx, "LineupStatus"] = "PROJECTED 🟡"
+                    
+            bench_idx = team_hitters[~team_hitters.index.isin(top_9_idx)].index
+            df_out.loc[bench_idx, "BattingOrder"] = 0
+            df_out.loc[bench_idx, "Projection"] = 0.0
+            df_out.loc[bench_idx, "LineupStatus"] = "BENCH ❌"
+            df_out.loc[bench_idx, "IsConfirmedStarter"] = False
 
-  if "OriginalProjection" not in df_out.columns:
-    df_out["OriginalProjection"] = df_out["Projection"].copy()
-  if "LineupStatus" not in df_out.columns:
-    df_out["LineupStatus"] = "PROJECTED 🟡"
-  if "IsConfirmedStarter" not in df_out.columns:
-    df_out["IsConfirmedStarter"] = False
+        # Pitchers
+        team_p_mask = (df_out["Team"] == team) & (df_out["Position"].str.contains("P", na=False))
+        team_pitchers = df_out[team_p_mask]
+        if not team_pitchers.empty and not team_pitchers["IsConfirmedStarter"].any():
+            top_sp_idx = team_pitchers.sort_values(by=["Projection", "Salary"], ascending=[False, False]).index[:1]
+            df_out.loc[top_sp_idx, "IsConfirmedStarter"] = True
+            non_sp_idx = team_pitchers[~team_pitchers.index.isin(top_sp_idx)].index
+            df_out.loc[non_sp_idx, "Projection"] = 0.0
+            df_out.loc[non_sp_idx, "IsConfirmedStarter"] = False
 
-  for team in df_out["Team"].unique():
-    team_h_mask = (df_out["Team"] == team) & (
-        ~df_out["Position"].isin(["P", "SP", "RP"])
-    )
-    team_hitters = df_out[team_h_mask]
-
-    has_full_order = (team_hitters["BattingOrder"].between(1, 9)).sum() >= 9
-    if not has_full_order and not team_hitters.empty:
-      top_9_idx = team_hitters.sort_values(
-          by=["Projection", "Salary"], ascending=[False, False]
-      ).index[:9]
-      for rank, idx in enumerate(top_9_idx, 1):
-        df_out.loc[idx, "BattingOrder"] = rank
-        df_out.loc[idx, "IsConfirmedStarter"] = True
-        if df_out.loc[idx, "LineupStatus"] != "CONFIRMED 🟢":
-          df_out.loc[idx, "LineupStatus"] = "PROJECTED 🟡"
-
-      bench_idx = team_hitters[~team_hitters.index.isin(top_9_idx)].index
-      df_out.loc[bench_idx, "BattingOrder"] = 0
-      df_out.loc[bench_idx, "Projection"] = 0.0
-      df_out.loc[bench_idx, "LineupStatus"] = "BENCH ❌"
-      df_out.loc[bench_idx, "IsConfirmedStarter"] = False
-
-    team_p_mask = (df_out["Team"] == team) & (
-        df_out["Position"].str.contains("P", na=False)
-    )
-    team_pitchers = df_out[team_p_mask]
-    if not team_pitchers.empty and not team_pitchers["IsConfirmedStarter"].any():
-      top_sp_idx = team_pitchers.sort_values(
-          by=["Projection", "Salary"], ascending=[False, False]
-      ).index[:1]
-      df_out.loc[top_sp_idx, "IsConfirmedStarter"] = True
-      non_sp_idx = team_pitchers[~team_pitchers.index.isin(top_sp_idx)].index
-      df_out.loc[non_sp_idx, "Projection"] = 0.0
-      df_out.loc[non_sp_idx, "IsConfirmedStarter"] = False
-
-  return df_out
-
+    return df_out
 
 # -----------------------------------------------------------------------------
 # 4. Matchup Adjustment Function
 # -----------------------------------------------------------------------------
 def apply_dynamic_matchup_adjustments(df_input):
-  """Adjusts hitter projections based on Vegas Implied Totals and Opposing SP Quality."""
-  df_adj = df_input.copy()
-
-  sp_rows = df_adj[(df_adj["Position"] == "P") & (df_adj["Projection"] > 0)]
-  sp_salary_map = {}
-  for _, row in sp_rows.iterrows():
-    sp_salary_map[row["Team"]] = row["Salary"]
-
-  for idx, row in df_adj.iterrows():
-    if row["Position"] != "P" and row["Projection"] > 0:
-      opp_team = row.get("Opponent", "")
-      implied_runs = row.get("ImpliedRuns", 4.5)
-
-      # 1. Vegas Factor
-      vegas_mult = np.clip(implied_runs / 4.5, 0.80, 1.25)
-
-      # 2. Opposing SP Suppression / Boost
-      opp_sp_sal = sp_salary_map.get(opp_team, 7500)
-      if opp_sp_sal >= 9500:
-        sp_mult = 0.85  # Ace matchup (-15%)
-      elif opp_sp_sal >= 8000:
-        sp_mult = 0.93  # Above avg (-7%)
-      elif opp_sp_sal <= 6500:
-        sp_mult = 1.10  # Vulnerable pitcher (+10%)
-      else:
-        sp_mult = 1.00  # Average matchup
-
-      base_p = row.get("OriginalProjection", row["Projection"])
-      df_adj.loc[idx, "Projection"] = round(base_p * vegas_mult * sp_mult, 2)
-
-  return df_adj
-
+    """
+    Adjusts hitter projections based on Vegas Implied Totals and Opposing SP Quality.
+    """
+    df_adj = df_input.copy()
+    
+    # Map active SP salary per team
+    sp_rows = df_adj[(df_adj["Position"] == "P") & (df_adj["Projection"] > 0)]
+    sp_salary_map = {}
+    for _, row in sp_rows.iterrows():
+        sp_salary_map[row["Team"]] = row["Salary"]
+        
+    for idx, row in df_adj.iterrows():
+        if row["Position"] != "P" and row["Projection"] > 0:
+            opp_team = row.get("Opponent", "")
+            implied_runs = row.get("ImpliedRuns", 4.5)
+            
+            # 1. Vegas Factor
+            vegas_mult = np.clip(implied_runs / 4.5, 0.80, 1.25)
+            
+            # 2. Opposing SP Suppression / Boost
+            opp_sp_sal = sp_salary_map.get(opp_team, 7500)
+            if opp_sp_sal >= 9500:
+                sp_mult = 0.85  # Ace matchup (-15%)
+            elif opp_sp_sal >= 8000:
+                sp_mult = 0.93  # Above avg (-7%)
+            elif opp_sp_sal <= 6500:
+                sp_mult = 1.10  # Vulnerable pitcher (+10%)
+            else:
+                sp_mult = 1.00  # Average matchup
+                
+            base_p = row.get("OriginalProjection", row["Projection"])
+            df_adj.loc[idx, "Projection"] = round(base_p * vegas_mult * sp_mult, 2)
+            
+    return df_adj
 
 # -----------------------------------------------------------------------------
 # 5. Live MLB Stats API Two-Tier Lineup Sync Engine
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_mlb_confirmed_lineups(target_date_str):
-  url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={target_date_str}&hydrate=lineups,probablePitcher"
-  req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-  try:
-    with urllib.request.urlopen(req, timeout=8) as response:
-      data = json.loads(response.read().decode("utf-8"))
-  except Exception as e:
-    return None, None, f"Error connecting to MLB API: {e}"
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={target_date_str}&hydrate=lineups,probablePitcher"
+    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    try:
+        with urllib.request.urlopen(req, timeout=8) as response:
+            data = json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        return None, None, f"Error connecting to MLB API: {e}"
 
-  abbr_map = {
-      "Toronto Blue Jays": "TOR",
-      "New York Yankees": "NYY",
-      "Boston Red Sox": "BOS",
-      "Atlanta Braves": "ATL",
-      "Milwaukee Brewers": "MIL",
-      "Miami Marlins": "MIA",
-      "Washington Nationals": "WSH",
-      "Los Angeles Dodgers": "LAD",
-      "Chicago Cubs": "CHC",
-      "Chicago White Sox": "CWS",
-      "Philadelphia Phillies": "PHI",
-      "New York Mets": "NYM",
-      "Houston Astros": "HOU",
-      "Texas Rangers": "TEX",
-      "Seattle Mariners": "SEA",
-      "San Francisco Giants": "SF",
-      "San Diego Padres": "SD",
-      "St. Louis Cardinals": "STL",
-      "Tampa Bay Rays": "TB",
-      "Baltimore Orioles": "BAL",
-      "Minnesota Twins": "MIN",
-      "Detroit Tigers": "DET",
-      "Cleveland Guardians": "CLE",
-      "Kansas City Royals": "KC",
-      "Cincinnati Reds": "CIN",
-      "Pittsburgh Pirates": "PIT",
-      "Arizona Diamondbacks": "ARI",
-      "Colorado Rockies": "COL",
-      "Oakland Athletics": "OAK",
-      "Los Angeles Angels": "LAA",
-  }
+    abbr_map = {
+        "Toronto Blue Jays": "TOR", "New York Yankees": "NYY", "Boston Red Sox": "BOS",
+        "Atlanta Braves": "ATL", "Milwaukee Brewers": "MIL", "Miami Marlins": "MIA",
+        "Washington Nationals": "WSH", "Los Angeles Dodgers": "LAD", "Chicago Cubs": "CHC",
+        "Chicago White Sox": "CWS", "Philadelphia Phillies": "PHI", "New York Mets": "NYM",
+        "Houston Astros": "HOU", "Texas Rangers": "TEX", "Seattle Mariners": "SEA",
+        "San Francisco Giants": "SF", "San Diego Padres": "SD", "St. Louis Cardinals": "STL",
+        "Tampa Bay Rays": "TB", "Baltimore Orioles": "BAL", "Minnesota Twins": "MIN",
+        "Detroit Tigers": "DET", "Cleveland Guardians": "CLE", "Kansas City Royals": "KC",
+        "Cincinnati Reds": "CIN", "Pittsburgh Pirates": "PIT", "Arizona Diamondbacks": "ARI",
+        "Colorado Rockies": "COL", "Oakland Athletics": "OAK", "Los Angeles Angels": "LAA"
+    }
 
-  confirmed_lineups = {}
-  probable_pitchers = {}
+    confirmed_lineups = {}
+    probable_pitchers = {}
 
-  for date_obj in data.get("dates", []):
-    for game in date_obj.get("games", []):
-      teams = game.get("teams", {})
-      away_team_obj = teams.get("away", {}).get("team", {})
-      home_team_obj = teams.get("home", {}).get("team", {})
+    for date_obj in data.get("dates", []):
+        for game in date_obj.get("games", []):
+            teams = game.get("teams", {})
+            away_team_obj = teams.get("away", {}).get("team", {})
+            home_team_obj = teams.get("home", {}).get("team", {})
+            
+            away_abbr = away_team_obj.get("abbreviation") or abbr_map.get(away_team_obj.get("name"), away_team_obj.get("name"))
+            home_abbr = home_team_obj.get("abbreviation") or abbr_map.get(home_team_obj.get("name"), home_team_obj.get("name"))
+            
+            # Probable Starting Pitchers
+            away_sp = teams.get("away", {}).get("probablePitcher", {}).get("fullName")
+            home_sp = teams.get("home", {}).get("probablePitcher", {}).get("fullName")
+            if away_sp: probable_pitchers[away_abbr] = away_sp
+            if home_sp: probable_pitchers[home_abbr] = home_sp
+            
+            # Official Batting Orders
+            lineups = game.get("lineups", {})
+            away_players = [p.get("fullName") for p in lineups.get("awayPlayers", [])]
+            home_players = [p.get("fullName") for p in lineups.get("homePlayers", [])]
+            
+            if len(away_players) >= 9:
+                confirmed_lineups[away_abbr] = away_players[:9]
+            if len(home_players) >= 9:
+                confirmed_lineups[home_abbr] = home_players[:9]
 
-      away_abbr = away_team_obj.get("abbreviation") or abbr_map.get(
-          away_team_obj.get("name"), away_team_obj.get("name")
-      )
-      home_abbr = home_team_obj.get("abbreviation") or abbr_map.get(
-          home_team_obj.get("name"), home_team_obj.get("name")
-      )
-
-      away_sp = teams.get("away", {}).get("probablePitcher", {}).get("fullName")
-      home_sp = teams.get("home", {}).get("probablePitcher", {}).get("fullName")
-      if away_sp:
-        probable_pitchers[away_abbr] = away_sp
-      if home_sp:
-        probable_pitchers[home_abbr] = home_sp
-
-      lineups = game.get("lineups", {})
-      away_players = [
-          p.get("fullName") for p in lineups.get("awayPlayers", [])
-      ]
-      home_players = [
-          p.get("fullName") for p in lineups.get("homePlayers", [])
-      ]
-
-      if len(away_players) >= 9:
-        confirmed_lineups[away_abbr] = away_players[:9]
-      if len(home_players) >= 9:
-        confirmed_lineups[home_abbr] = home_players[:9]
-
-  return confirmed_lineups, probable_pitchers, None
-
+    return confirmed_lineups, probable_pitchers, None
 
 def apply_two_tier_sync(df_input, confirmed_lineups, probable_pitchers):
-  df_out = df_input.copy()
-
-  if "OriginalProjection" not in df_out.columns:
-    df_out["OriginalProjection"] = df_out["Projection"].copy()
-  else:
-    df_out["Projection"] = df_out["OriginalProjection"].copy()
-
-  df_out["LineupStatus"] = "PROJECTED 🟡"
-  df_out["IsConfirmedStarter"] = False
-  df_out["BattingOrder"] = 0
-
-  matched_pitchers_summary = []
-  confirmed_teams_count = 0
-  projected_teams_count = 0
-
-  # 1. Pitcher Synchronization & Exclusion
-  for team in df_out["Team"].unique():
-    team_p_mask = (df_out["Team"] == team) & (
-        df_out["Position"].str.contains("P", na=False)
-    )
-    if not team_p_mask.any():
-      continue
-
-    if team in probable_pitchers:
-      sp_name = probable_pitchers[team]
-      matched_idx = match_player_to_dk(sp_name, df_out[team_p_mask])
-      if matched_idx is not None:
-        df_out.loc[matched_idx, "IsConfirmedStarter"] = True
-        matched_pitchers_summary.append(
-            (team, df_out.loc[matched_idx, "Name"], "Probable SP 🟢")
-        )
-
-        non_sp = team_p_mask & (df_out.index != matched_idx)
-        df_out.loc[non_sp, "Projection"] = 0.0
-        df_out.loc[non_sp, "IsConfirmedStarter"] = False
+    df_out = df_input.copy()
+    
+    if "OriginalProjection" not in df_out.columns:
+        df_out["OriginalProjection"] = df_out["Projection"].copy()
     else:
-      top_p_indices = df_out[team_p_mask].sort_values(
-          by=["Projection", "Salary"], ascending=[False, False]
-      ).index
-      if len(top_p_indices) > 0:
-        top_sp_idx = top_p_indices[0]
-        df_out.loc[top_sp_idx, "IsConfirmedStarter"] = True
-        matched_pitchers_summary.append(
-            (team, df_out.loc[top_sp_idx, "Name"], "Projected SP 🟡")
-        )
-        non_sp = team_p_mask & (df_out.index != top_sp_idx)
-        df_out.loc[non_sp, "Projection"] = 0.0
+        df_out["Projection"] = df_out["OriginalProjection"].copy()
 
-  # 2. Hitter Synchronization (Confirmed vs Projected)
-  for team in df_out["Team"].unique():
-    team_h_mask = (df_out["Team"] == team) & (
-        ~df_out["Position"].isin(["P", "SP", "RP"])
-    )
-    if not team_h_mask.any():
-      continue
+    df_out["LineupStatus"] = "PROJECTED 🟡"
+    df_out["IsConfirmedStarter"] = False
+    df_out["BattingOrder"] = 0
+    
+    matched_pitchers_summary = []
+    confirmed_teams_count = 0
+    projected_teams_count = 0
 
-    if team in confirmed_lineups and len(confirmed_lineups[team]) >= 9:
-      confirmed_teams_count += 1
-      matched_h_indices = []
-      for slot_num, p_name in enumerate(confirmed_lineups[team], 1):
-        matched_h_idx = match_player_to_dk(p_name, df_out[team_h_mask])
-        if matched_h_idx is not None:
-          df_out.loc[matched_h_idx, "BattingOrder"] = slot_num
-          df_out.loc[matched_h_idx, "IsConfirmedStarter"] = True
-          df_out.loc[matched_h_idx, "LineupStatus"] = "CONFIRMED 🟢"
-          matched_h_indices.append(matched_h_idx)
+    # 1. PITCHER SYNCHRONIZATION & HARD EXCLUSION OF BENCH ARMS
+    for team in df_out["Team"].unique():
+        team_p_mask = (df_out["Team"] == team) & (df_out["Position"].str.contains("P", na=False))
+        if not team_p_mask.any():
+            continue
+            
+        if team in probable_pitchers:
+            sp_name = probable_pitchers[team]
+            matched_idx = match_player_to_dk(sp_name, df_out[team_p_mask])
+            if matched_idx is not None:
+                df_out.loc[matched_idx, "IsConfirmedStarter"] = True
+                matched_pitchers_summary.append((team, df_out.loc[matched_idx, "Name"], "Probable SP 🟢"))
+                
+                # Zero out non-starting pitchers on this team
+                non_sp = team_p_mask & (df_out.index != matched_idx)
+                df_out.loc[non_sp, "Projection"] = 0.0
+                df_out.loc[non_sp, "IsConfirmedStarter"] = False
+        else:
+            top_p_indices = df_out[team_p_mask].sort_values(by=["Projection", "Salary"], ascending=[False, False]).index
+            if len(top_p_indices) > 0:
+                top_sp_idx = top_p_indices[0]
+                df_out.loc[top_sp_idx, "IsConfirmedStarter"] = True
+                matched_pitchers_summary.append((team, df_out.loc[top_sp_idx, "Name"], "Projected SP 🟡"))
+                non_sp = team_p_mask & (df_out.index != top_sp_idx)
+                df_out.loc[non_sp, "Projection"] = 0.0
 
-      bench_mask = team_h_mask & (~df_out.index.isin(matched_h_indices))
-      df_out.loc[bench_mask, "BattingOrder"] = 0
-      df_out.loc[bench_mask, "Projection"] = 0.0
-      df_out.loc[bench_mask, "LineupStatus"] = "BENCH ❌"
-      df_out.loc[bench_mask, "IsConfirmedStarter"] = False
-    else:
-      projected_teams_count += 1
-      top_9_h_indices = df_out[team_h_mask].sort_values(
-          by=["Projection", "Salary"], ascending=[False, False]
-      ).index[:9]
-      for rank, h_idx in enumerate(top_9_h_indices, 1):
-        df_out.loc[h_idx, "BattingOrder"] = rank
-        df_out.loc[h_idx, "IsConfirmedStarter"] = True
-        df_out.loc[h_idx, "LineupStatus"] = "PROJECTED 🟡"
+    # 2. HITTER SYNCHRONIZATION (CONFIRMED 🟢 vs PROJECTED 🟡)
+    for team in df_out["Team"].unique():
+        team_h_mask = (df_out["Team"] == team) & (~df_out["Position"].isin(["P", "SP", "RP"]))
+        if not team_h_mask.any():
+            continue
 
-      deep_bench_mask = team_h_mask & (~df_out.index.isin(top_9_h_indices))
-      df_out.loc[deep_bench_mask, "BattingOrder"] = 0
-      df_out.loc[deep_bench_mask, "Projection"] = 0.0
-      df_out.loc[deep_bench_mask, "LineupStatus"] = "BENCH ❌"
-      df_out.loc[deep_bench_mask, "IsConfirmedStarter"] = False
+        if team in confirmed_lineups and len(confirmed_lineups[team]) >= 9:
+            confirmed_teams_count += 1
+            matched_h_indices = []
+            for slot_num, p_name in enumerate(confirmed_lineups[team], 1):
+                matched_h_idx = match_player_to_dk(p_name, df_out[team_h_mask])
+                if matched_h_idx is not None:
+                    df_out.loc[matched_h_idx, "BattingOrder"] = slot_num
+                    df_out.loc[matched_h_idx, "IsConfirmedStarter"] = True
+                    df_out.loc[matched_h_idx, "LineupStatus"] = "CONFIRMED 🟢"
+                    matched_h_indices.append(matched_h_idx)
+                    
+            bench_mask = team_h_mask & (~df_out.index.isin(matched_h_indices))
+            df_out.loc[bench_mask, "BattingOrder"] = 0
+            df_out.loc[bench_mask, "Projection"] = 0.0
+            df_out.loc[bench_mask, "LineupStatus"] = "BENCH ❌"
+            df_out.loc[bench_mask, "IsConfirmedStarter"] = False
+        else:
+            projected_teams_count += 1
+            top_9_h_indices = df_out[team_h_mask].sort_values(by=["Projection", "Salary"], ascending=[False, False]).index[:9]
+            for rank, h_idx in enumerate(top_9_h_indices, 1):
+                df_out.loc[h_idx, "BattingOrder"] = rank
+                df_out.loc[h_idx, "IsConfirmedStarter"] = True
+                df_out.loc[h_idx, "LineupStatus"] = "PROJECTED 🟡"
+                
+            deep_bench_mask = team_h_mask & (~df_out.index.isin(top_9_h_indices))
+            df_out.loc[deep_bench_mask, "BattingOrder"] = 0
+            df_out.loc[deep_bench_mask, "Projection"] = 0.0
+            df_out.loc[deep_bench_mask, "LineupStatus"] = "BENCH ❌"
+            df_out.loc[deep_bench_mask, "IsConfirmedStarter"] = False
 
-  return (
-      df_out,
-      matched_pitchers_summary,
-      confirmed_teams_count,
-      projected_teams_count,
-  )
-
+    return df_out, matched_pitchers_summary, confirmed_teams_count, projected_teams_count
 
 # -----------------------------------------------------------------------------
 # 6. CSV Ingestion & Parser
 # -----------------------------------------------------------------------------
 def parse_and_clean_dk_slate(file_source):
-  try:
-    if isinstance(file_source, str):
-      with open(file_source, "r", encoding="utf-8", errors="ignore") as f:
-        first_chunk = "".join([f.readline() for _ in range(12)])
+    try:
+        if isinstance(file_source, str):
+            with open(file_source, "r", encoding="utf-8", errors="ignore") as f:
+                first_chunk = "".join([f.readline() for _ in range(12)])
+        else:
+            first_chunk = file_source.read(4096).decode("utf-8", errors="ignore")
+            file_source.seek(0)
+            
+        if "Instructions" in first_chunk or "Locate the player" in first_chunk:
+            df = pd.read_csv(file_source, skiprows=7)
+        else:
+            df = pd.read_csv(file_source)
+    except Exception:
+        df = pd.read_csv(file_source, skiprows=7)
+
+    df = df[[c for c in df.columns if not str(c).startswith("Unnamed")]].copy()
+    
+    col_rename = {}
+    for c in df.columns:
+        c_clean = str(c).strip().lower().replace(" ", "").replace("_", "").replace(":", "").replace("%", "")
+        if c_clean in ["teamabbrev", "team"]:
+            col_rename[c] = "Team"
+        elif c_clean in ["avgpointspergame", "projection", "proj", "fpts", "points"]:
+            col_rename[c] = "Projection"
+        elif c_clean in ["name", "playername", "player"]:
+            col_rename[c] = "Name"
+        elif c_clean in ["salary", "dksalary"]:
+            col_rename[c] = "Salary"
+        elif c_clean in ["ownership", "own", "ownpct", "projectedownership"]:
+            col_rename[c] = "Ownership"
+        elif c_clean in ["battingorder", "order", "batting"]:
+            col_rename[c] = "BattingOrder"
+        elif c_clean in ["opponent", "opp"]:
+            col_rename[c] = "Opponent"
+        elif c_clean in ["gameinfo", "game"]:
+            col_rename[c] = "Game Info"
+        elif c_clean in ["position", "pos"] and "roster" not in c_clean:
+            col_rename[c] = "Position"
+        elif c_clean in ["impliedruns", "vegas", "impliedtotal"]:
+            col_rename[c] = "ImpliedRuns"
+
+    df = df.rename(columns=col_rename)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    if "Name" in df.columns:
+        df = df.dropna(subset=["Name"]).copy()
+    if "Salary" in df.columns:
+        df = df.dropna(subset=["Salary"]).copy()
+
+    if "Team" not in df.columns:
+        df["Team"] = df.get("TeamAbbrev", "UNKNOWN")
+    df["Team"] = df["Team"].astype(str).str.strip()
+
+    if "Position" not in df.columns:
+        df["Position"] = df.get("Roster Position", "OF")
+    df["Position"] = df["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
+
+    if "Salary" in df.columns:
+        df["Salary"] = (
+            df["Salary"]
+            .astype(str)
+            .str.replace("$", "", regex=False)
+            .str.replace(",", "", regex=False)
+            .str.strip()
+        )
+        df["Salary"] = pd.to_numeric(df["Salary"], errors="coerce").fillna(0).astype(int)
+
+    if "Projection" not in df.columns:
+        df["Projection"] = pd.to_numeric(df.get("AvgPointsPerGame", 5.0), errors="coerce").fillna(0.0)
     else:
-      first_chunk = file_source.read(4096).decode("utf-8", errors="ignore")
-      file_source.seek(0)
+        df["Projection"] = pd.to_numeric(df["Projection"], errors="coerce").fillna(0.0)
 
-    if "Instructions" in first_chunk or "Locate the player" in first_chunk:
-      df = pd.read_csv(file_source, skiprows=7)
+    if "Opponent" not in df.columns:
+        if "Game Info" in df.columns:
+            def extract_opp(row):
+                g = str(row.get("Game Info", ""))
+                t = str(row.get("Team", ""))
+                if "@" in g:
+                    matchup = g.split(" ")[0].split("@")
+                    if len(matchup) == 2:
+                        return matchup[1] if t == matchup[0] else matchup[0]
+                return "OPP"
+            df["Opponent"] = df.apply(extract_opp, axis=1)
+        else:
+            df["Opponent"] = "OPP"
+
+    if "BattingOrder" not in df.columns:
+        df["BattingOrder"] = 0
     else:
-      df = pd.read_csv(file_source)
-  except Exception:
-    df = pd.read_csv(file_source, skiprows=7)
+        df["BattingOrder"] = pd.to_numeric(df["BattingOrder"], errors="coerce").fillna(0).astype(int)
 
-  df = df[[c for c in df.columns if not str(c).startswith("Unnamed")]].copy()
-
-  col_rename = {}
-  for c in df.columns:
-    c_clean = (
-        str(c)
-        .strip()
-        .lower()
-        .replace(" ", "")
-        .replace("_", "")
-        .replace(":", "")
-        .replace("%", "")
-    )
-    if c_clean in ["teamabbrev", "team"]:
-      col_rename[c] = "Team"
-    elif c_clean in [
-        "avgpointspergame",
-        "projection",
-        "proj",
-        "fpts",
-        "points",
-    ]:
-      col_rename[c] = "Projection"
-    elif c_clean in ["name", "playername", "player"]:
-      col_rename[c] = "Name"
-    elif c_clean in ["salary", "dksalary"]:
-      col_rename[c] = "Salary"
-    elif c_clean in ["ownership", "own", "ownpct", "projectedownership"]:
-      col_rename[c] = "Ownership"
-    elif c_clean in ["battingorder", "order", "batting"]:
-      col_rename[c] = "BattingOrder"
-    elif c_clean in ["opponent", "opp"]:
-      col_rename[c] = "Opponent"
-    elif c_clean in ["gameinfo", "game"]:
-      col_rename[c] = "Game Info"
-    elif c_clean in ["position", "pos"] and "roster" not in c_clean:
-      col_rename[c] = "Position"
-    elif c_clean in ["impliedruns", "vegas", "impliedtotal"]:
-      col_rename[c] = "ImpliedRuns"
-
-  df = df.rename(columns=col_rename)
-  df = df.loc[:, ~df.columns.duplicated()].copy()
-
-  if "Name" in df.columns:
-    df = df.dropna(subset=["Name"]).copy()
-  if "Salary" in df.columns:
-    df = df.dropna(subset=["Salary"]).copy()
-
-  if "Team" not in df.columns:
-    df["Team"] = df.get("TeamAbbrev", "UNKNOWN")
-  df["Team"] = df["Team"].astype(str).str.strip()
-
-  if "Position" not in df.columns:
-    df["Position"] = df.get("Roster Position", "OF")
-  df["Position"] = (
-      df["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
-  )
-
-  if "Salary" in df.columns:
-    df["Salary"] = (
-        df["Salary"]
-        .astype(str)
-        .str.replace("$", "", regex=False)
-        .str.replace(",", "", regex=False)
-        .str.strip()
-    )
-    df["Salary"] = (
-        pd.to_numeric(df["Salary"], errors="coerce").fillna(0).astype(int)
-    )
-
-  if "Projection" not in df.columns:
-    df["Projection"] = pd.to_numeric(
-        df.get("AvgPointsPerGame", 5.0), errors="coerce"
-    ).fillna(0.0)
-  else:
-    df["Projection"] = pd.to_numeric(
-        df["Projection"], errors="coerce"
-    ).fillna(0.0)
-
-  if "Opponent" not in df.columns:
-    if "Game Info" in df.columns:
-
-      def extract_opp(row):
-        g = str(row.get("Game Info", ""))
-        t = str(row.get("Team", ""))
-        if "@" in g:
-          matchup = g.split(" ")[0].split("@")
-          if len(matchup) == 2:
-            return matchup[1] if t == matchup[0] else matchup[0]
-        return "OPP"
-
-      df["Opponent"] = df.apply(extract_opp, axis=1)
+    if "Ownership" not in df.columns:
+        df["Ownership"] = np.clip(np.round(df["Projection"] * 2.2, 1), 2.0, 50.0)
     else:
-      df["Opponent"] = "OPP"
+        df["Ownership"] = pd.to_numeric(df["Ownership"], errors="coerce").fillna(10.0)
 
-  if "BattingOrder" not in df.columns:
-    df["BattingOrder"] = 0
-  else:
-    df["BattingOrder"] = (
-        pd.to_numeric(df["BattingOrder"], errors="coerce")
-        .fillna(0)
-        .astype(int)
-    )
+    if "ImpliedRuns" not in df.columns:
+        df["ImpliedRuns"] = 4.5
+    else:
+        df["ImpliedRuns"] = pd.to_numeric(df["ImpliedRuns"], errors="coerce").fillna(4.5)
 
-  if "Ownership" not in df.columns:
-    df["Ownership"] = np.clip(np.round(df["Projection"] * 2.2, 1), 2.0, 50.0)
-  else:
-    df["Ownership"] = pd.to_numeric(
-        df["Ownership"], errors="coerce"
-    ).fillna(10.0)
-
-  if "ImpliedRuns" not in df.columns:
-    df["ImpliedRuns"] = 4.5
-  else:
-    df["ImpliedRuns"] = pd.to_numeric(
-        df["ImpliedRuns"], errors="coerce"
-    ).fillna(4.5)
-
-  df["OriginalProjection"] = df["Projection"].copy()
-  df["LineupStatus"] = "PROJECTED 🟡"
-  df["IsConfirmedStarter"] = True
-
-  return ensure_full_slate_integrity(df)
-
+    df["OriginalProjection"] = df["Projection"].copy()
+    df["LineupStatus"] = "PROJECTED 🟡"
+    df["IsConfirmedStarter"] = True
+    
+    return ensure_full_slate_integrity(df)
 
 # -----------------------------------------------------------------------------
 # 7. Built-In Sample Slate
 # -----------------------------------------------------------------------------
 def get_sample_slate():
-  data = [
-      {
-          "Name": "Gerrit Cole",
-          "Position": "P",
-          "Team": "NYY",
-          "Opponent": "BOS",
-          "Salary": 10200,
-          "Projection": 22.4,
-          "Ownership": 28.5,
-          "BattingOrder": 0,
-          "ImpliedRuns": 4.2,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Brayan Bello",
-          "Position": "P",
-          "Team": "BOS",
-          "Opponent": "NYY",
-          "Salary": 7400,
-          "Projection": 14.1,
-          "Ownership": 12.0,
-          "BattingOrder": 0,
-          "ImpliedRuns": 5.3,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Anthony Volpe",
-          "Position": "SS",
-          "Team": "NYY",
-          "Opponent": "BOS",
-          "Salary": 4200,
-          "Projection": 8.9,
-          "Ownership": 15.2,
-          "BattingOrder": 1,
-          "ImpliedRuns": 5.3,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Juan Soto",
-          "Position": "OF",
-          "Team": "NYY",
-          "Opponent": "BOS",
-          "Salary": 6100,
-          "Projection": 12.8,
-          "Ownership": 24.1,
-          "BattingOrder": 2,
-          "ImpliedRuns": 5.3,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Aaron Judge",
-          "Position": "OF",
-          "Team": "NYY",
-          "Opponent": "BOS",
-          "Salary": 6400,
-          "Projection": 14.2,
-          "Ownership": 27.5,
-          "BattingOrder": 3,
-          "ImpliedRuns": 5.3,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Giancarlo Stanton",
-          "Position": "OF",
-          "Team": "NYY",
-          "Opponent": "BOS",
-          "Salary": 4800,
-          "Projection": 9.7,
-          "Ownership": 14.8,
-          "BattingOrder": 4,
-          "ImpliedRuns": 5.3,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Jazz Chisholm Jr.",
-          "Position": "3B/2B",
-          "Team": "NYY",
-          "Opponent": "BOS",
-          "Salary": 4900,
-          "Projection": 9.4,
-          "Ownership": 16.0,
-          "BattingOrder": 5,
-          "ImpliedRuns": 5.3,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Austin Wells",
-          "Position": "C",
-          "Team": "NYY",
-          "Opponent": "BOS",
-          "Salary": 3800,
-          "Projection": 7.8,
-          "Ownership": 11.2,
-          "BattingOrder": 6,
-          "ImpliedRuns": 5.3,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Anthony Rizzo",
-          "Position": "1B",
-          "Team": "NYY",
-          "Opponent": "BOS",
-          "Salary": 3500,
-          "Projection": 7.1,
-          "Ownership": 8.4,
-          "BattingOrder": 7,
-          "ImpliedRuns": 5.3,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Jarren Duran",
-          "Position": "OF",
-          "Team": "BOS",
-          "Opponent": "NYY",
-          "Salary": 5300,
-          "Projection": 10.5,
-          "Ownership": 17.3,
-          "BattingOrder": 1,
-          "ImpliedRuns": 4.2,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Rafael Devers",
-          "Position": "3B",
-          "Team": "BOS",
-          "Opponent": "NYY",
-          "Salary": 5600,
-          "Projection": 11.2,
-          "Ownership": 19.5,
-          "BattingOrder": 2,
-          "ImpliedRuns": 4.2,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Tyler O'Neill",
-          "Position": "OF",
-          "Team": "BOS",
-          "Opponent": "NYY",
-          "Salary": 4600,
-          "Projection": 9.0,
-          "Ownership": 13.0,
-          "BattingOrder": 3,
-          "ImpliedRuns": 4.2,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Triston Casas",
-          "Position": "1B",
-          "Team": "BOS",
-          "Opponent": "NYY",
-          "Salary": 4300,
-          "Projection": 8.5,
-          "Ownership": 10.5,
-          "BattingOrder": 4,
-          "ImpliedRuns": 4.2,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Masataka Yoshida",
-          "Position": "OF",
-          "Team": "BOS",
-          "Opponent": "NYY",
-          "Salary": 3700,
-          "Projection": 7.6,
-          "Ownership": 7.8,
-          "BattingOrder": 5,
-          "ImpliedRuns": 4.2,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Connor Wong",
-          "Position": "C",
-          "Team": "BOS",
-          "Opponent": "NYY",
-          "Salary": 3400,
-          "Projection": 6.8,
-          "Ownership": 6.2,
-          "BattingOrder": 6,
-          "ImpliedRuns": 4.2,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Ceddanne Rafaela",
-          "Position": "SS/OF",
-          "Team": "BOS",
-          "Opponent": "NYY",
-          "Salary": 3600,
-          "Projection": 7.2,
-          "Ownership": 8.0,
-          "BattingOrder": 7,
-          "ImpliedRuns": 4.2,
-          "Game Info": "NYY@BOS 08/30/2026 07:05PM ET",
-      },
-      {
-          "Name": "Yoshinobu Yamamoto",
-          "Position": "P",
-          "Team": "LAD",
-          "Opponent": "COL",
-          "Salary": 9600,
-          "Projection": 19.8,
-          "Ownership": 21.0,
-          "BattingOrder": 0,
-          "ImpliedRuns": 4.5,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Kyle Freeland",
-          "Position": "P",
-          "Team": "COL",
-          "Opponent": "LAD",
-          "Salary": 5000,
-          "Projection": 9.2,
-          "Ownership": 4.1,
-          "BattingOrder": 0,
-          "ImpliedRuns": 7.0,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Shohei Ohtani",
-          "Position": "OF",
-          "Team": "LAD",
-          "Opponent": "COL",
-          "Salary": 6700,
-          "Projection": 15.8,
-          "Ownership": 34.0,
-          "BattingOrder": 1,
-          "ImpliedRuns": 7.0,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Mookie Betts",
-          "Position": "SS/OF",
-          "Team": "LAD",
-          "Opponent": "COL",
-          "Salary": 6200,
-          "Projection": 13.5,
-          "Ownership": 28.0,
-          "BattingOrder": 2,
-          "ImpliedRuns": 7.0,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Freddie Freeman",
-          "Position": "1B",
-          "Team": "LAD",
-          "Opponent": "COL",
-          "Salary": 5800,
-          "Projection": 12.6,
-          "Ownership": 23.5,
-          "BattingOrder": 3,
-          "ImpliedRuns": 7.0,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Teoscar Hernandez",
-          "Position": "OF",
-          "Team": "LAD",
-          "Opponent": "COL",
-          "Salary": 5100,
-          "Projection": 11.0,
-          "Ownership": 20.2,
-          "BattingOrder": 4,
-          "ImpliedRuns": 7.0,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Max Muncy",
-          "Position": "3B",
-          "Team": "LAD",
-          "Opponent": "COL",
-          "Salary": 4700,
-          "Projection": 9.9,
-          "Ownership": 15.4,
-          "BattingOrder": 5,
-          "ImpliedRuns": 7.0,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Will Smith",
-          "Position": "C",
-          "Team": "LAD",
-          "Opponent": "COL",
-          "Salary": 5200,
-          "Projection": 10.4,
-          "Ownership": 18.0,
-          "BattingOrder": 6,
-          "ImpliedRuns": 7.0,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Gavin Lux",
-          "Position": "2B",
-          "Team": "LAD",
-          "Opponent": "COL",
-          "Salary": 3900,
-          "Projection": 8.1,
-          "Ownership": 11.0,
-          "BattingOrder": 7,
-          "ImpliedRuns": 7.0,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Ezequiel Tovar",
-          "Position": "SS",
-          "Team": "COL",
-          "Opponent": "LAD",
-          "Salary": 4400,
-          "Projection": 8.7,
-          "Ownership": 12.1,
-          "BattingOrder": 1,
-          "ImpliedRuns": 4.5,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Brenton Doyle",
-          "Position": "OF",
-          "Team": "COL",
-          "Opponent": "LAD",
-          "Salary": 4600,
-          "Projection": 9.1,
-          "Ownership": 14.0,
-          "BattingOrder": 2,
-          "ImpliedRuns": 4.5,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Ryan McMahon",
-          "Position": "3B",
-          "Team": "COL",
-          "Opponent": "LAD",
-          "Salary": 4200,
-          "Projection": 8.3,
-          "Ownership": 10.2,
-          "BattingOrder": 3,
-          "ImpliedRuns": 4.5,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Michael Toglia",
-          "Position": "1B/OF",
-          "Team": "COL",
-          "Opponent": "LAD",
-          "Salary": 3800,
-          "Projection": 7.9,
-          "Ownership": 9.5,
-          "BattingOrder": 4,
-          "ImpliedRuns": 4.5,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Brendan Rodgers",
-          "Position": "2B",
-          "Team": "COL",
-          "Opponent": "LAD",
-          "Salary": 3500,
-          "Projection": 7.0,
-          "Ownership": 6.5,
-          "BattingOrder": 5,
-          "ImpliedRuns": 4.5,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-      {
-          "Name": "Jacob Stallings",
-          "Position": "C",
-          "Team": "COL",
-          "Opponent": "LAD",
-          "Salary": 3100,
-          "Projection": 5.9,
-          "Ownership": 4.2,
-          "BattingOrder": 6,
-          "ImpliedRuns": 4.5,
-          "Game Info": "LAD@COL 08/30/2026 08:10PM ET",
-      },
-  ]
-  df = pd.DataFrame(data)
-  df["OriginalProjection"] = df["Projection"].copy()
-  df["LineupStatus"] = "CONFIRMED 🟢"
-  df["IsConfirmedStarter"] = True
-  return df
-
+    data = [
+        {"Name": "Gerrit Cole", "Position": "P", "Team": "NYY", "Opponent": "BOS", "Salary": 10200, "Projection": 22.4, "Ownership": 28.5, "BattingOrder": 0, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Brayan Bello", "Position": "P", "Team": "BOS", "Opponent": "NYY", "Salary": 7400, "Projection": 14.1, "Ownership": 12.0, "BattingOrder": 0, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Anthony Volpe", "Position": "SS", "Team": "NYY", "Opponent": "BOS", "Salary": 4200, "Projection": 8.9, "Ownership": 15.2, "BattingOrder": 1, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Juan Soto", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 6100, "Projection": 12.8, "Ownership": 24.1, "BattingOrder": 2, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Aaron Judge", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 6400, "Projection": 14.2, "Ownership": 27.5, "BattingOrder": 3, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Giancarlo Stanton", "Position": "OF", "Team": "NYY", "Opponent": "BOS", "Salary": 4800, "Projection": 9.7, "Ownership": 14.8, "BattingOrder": 4, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Jazz Chisholm Jr.", "Position": "3B/2B", "Team": "NYY", "Opponent": "BOS", "Salary": 4900, "Projection": 9.4, "Ownership": 16.0, "BattingOrder": 5, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Austin Wells", "Position": "C", "Team": "NYY", "Opponent": "BOS", "Salary": 3800, "Projection": 7.8, "Ownership": 11.2, "BattingOrder": 6, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Anthony Rizzo", "Position": "1B", "Team": "NYY", "Opponent": "BOS", "Salary": 3500, "Projection": 7.1, "Ownership": 8.4, "BattingOrder": 7, "ImpliedRuns": 5.3, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Jarren Duran", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 5300, "Projection": 10.5, "Ownership": 17.3, "BattingOrder": 1, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Rafael Devers", "Position": "3B", "Team": "BOS", "Opponent": "NYY", "Salary": 5600, "Projection": 11.2, "Ownership": 19.5, "BattingOrder": 2, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Tyler O'Neill", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 4600, "Projection": 9.0, "Ownership": 13.0, "BattingOrder": 3, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Triston Casas", "Position": "1B", "Team": "BOS", "Opponent": "NYY", "Salary": 4300, "Projection": 8.5, "Ownership": 10.5, "BattingOrder": 4, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Masataka Yoshida", "Position": "OF", "Team": "BOS", "Opponent": "NYY", "Salary": 3700, "Projection": 7.6, "Ownership": 7.8, "BattingOrder": 5, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Connor Wong", "Position": "C", "Team": "BOS", "Opponent": "NYY", "Salary": 3400, "Projection": 6.8, "Ownership": 6.2, "BattingOrder": 6, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Ceddanne Rafaela", "Position": "SS/OF", "Team": "BOS", "Opponent": "NYY", "Salary": 3600, "Projection": 7.2, "Ownership": 8.0, "BattingOrder": 7, "ImpliedRuns": 4.2, "Game Info": "NYY@BOS 08/30/2026 07:05PM ET"},
+        {"Name": "Yoshinobu Yamamoto", "Position": "P", "Team": "LAD", "Opponent": "COL", "Salary": 9600, "Projection": 19.8, "Ownership": 21.0, "BattingOrder": 0, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Kyle Freeland", "Position": "P", "Team": "COL", "Opponent": "LAD", "Salary": 5000, "Projection": 9.2, "Ownership": 4.1, "BattingOrder": 0, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Shohei Ohtani", "Position": "OF", "Team": "LAD", "Opponent": "COL", "Salary": 6700, "Projection": 15.8, "Ownership": 34.0, "BattingOrder": 1, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Mookie Betts", "Position": "SS/OF", "Team": "LAD", "Opponent": "COL", "Salary": 6200, "Projection": 13.5, "Ownership": 28.0, "BattingOrder": 2, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Freddie Freeman", "Position": "1B", "Team": "LAD", "Opponent": "COL", "Salary": 5800, "Projection": 12.6, "Ownership": 23.5, "BattingOrder": 3, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Teoscar Hernandez", "Position": "OF", "Team": "LAD", "Opponent": "COL", "Salary": 5100, "Projection": 11.0, "Ownership": 20.2, "BattingOrder": 4, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Max Muncy", "Position": "3B", "Team": "LAD", "Opponent": "COL", "Salary": 4700, "Projection": 9.9, "Ownership": 15.4, "BattingOrder": 5, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Will Smith", "Position": "C", "Team": "LAD", "Opponent": "COL", "Salary": 5200, "Projection": 10.4, "Ownership": 18.0, "BattingOrder": 6, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Gavin Lux", "Position": "2B", "Team": "LAD", "Opponent": "COL", "Salary": 3900, "Projection": 8.1, "Ownership": 11.0, "BattingOrder": 7, "ImpliedRuns": 7.0, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Ezequiel Tovar", "Position": "SS", "Team": "COL", "Opponent": "LAD", "Salary": 4400, "Projection": 8.7, "Ownership": 12.1, "BattingOrder": 1, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Brenton Doyle", "Position": "OF", "Team": "COL", "Opponent": "LAD", "Salary": 4600, "Projection": 9.1, "Ownership": 14.0, "BattingOrder": 2, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Ryan McMahon", "Position": "3B", "Team": "COL", "Opponent": "LAD", "Salary": 4200, "Projection": 8.3, "Ownership": 10.2, "BattingOrder": 3, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Michael Toglia", "Position": "1B/OF", "Team": "COL", "Opponent": "LAD", "Salary": 3800, "Projection": 7.9, "Ownership": 9.5, "BattingOrder": 4, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Brendan Rodgers", "Position": "2B", "Team": "COL", "Opponent": "LAD", "Salary": 3500, "Projection": 7.0, "Ownership": 6.5, "BattingOrder": 5, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"},
+        {"Name": "Jacob Stallings", "Position": "C", "Team": "COL", "Opponent": "LAD", "Salary": 3100, "Projection": 5.9, "Ownership": 4.2, "BattingOrder": 6, "ImpliedRuns": 4.5, "Game Info": "LAD@COL 08/30/2026 08:10PM ET"}
+    ]
+    df = pd.DataFrame(data)
+    df["OriginalProjection"] = df["Projection"].copy()
+    df["LineupStatus"] = "CONFIRMED 🟢"
+    df["IsConfirmedStarter"] = True
+    return df
 
 # -----------------------------------------------------------------------------
 # 8. Session State & Slate Ingestion
 # -----------------------------------------------------------------------------
 if "mlb_df" not in st.session_state:
-  st.session_state.mlb_df = get_sample_slate()
+    st.session_state.mlb_df = get_sample_slate()
 if "last_file_id" not in st.session_state:
-  st.session_state.last_file_id = None
+    st.session_state.last_file_id = None
 if "confirmed_pitchers_summary" not in st.session_state:
-  st.session_state.confirmed_pitchers_summary = []
+    st.session_state.confirmed_pitchers_summary = []
 
 st.sidebar.header("📁 Slate Ingestion")
-data_mode = st.sidebar.radio(
-    "Data Source", ["Use Sample Slate (3 Games)", "Upload DraftKings CSV"]
-)
+data_mode = st.sidebar.radio("Data Source", ["Use Sample Slate (3 Games)", "Upload DraftKings CSV"])
 
 if data_mode == "Upload DraftKings CSV":
-  uploaded_file = st.sidebar.file_uploader("Upload DK Slate CSV", type=["csv"])
-  if uploaded_file is not None:
-    file_id = f"{uploaded_file.name}_{uploaded_file.size}"
-    if st.session_state.last_file_id != file_id:
-      try:
-        st.session_state.mlb_df = parse_and_clean_dk_slate(uploaded_file)
-        st.session_state.last_file_id = file_id
-        st.session_state.confirmed_pitchers_summary = []
-        st.sidebar.success(
-            f"Loaded {len(st.session_state.mlb_df)} players across"
-            f" {st.session_state.mlb_df['Team'].nunique()} teams."
-        )
-      except Exception as e:
-        st.sidebar.error(f"Error parsing CSV: {e}")
-        st.session_state.mlb_df = get_sample_slate()
+    uploaded_file = st.sidebar.file_uploader("Upload DK Slate CSV", type=["csv"])
+    if uploaded_file is not None:
+        file_id = f"{uploaded_file.name}_{uploaded_file.size}"
+        if st.session_state.last_file_id != file_id:
+            try:
+                st.session_state.mlb_df = parse_and_clean_dk_slate(uploaded_file)
+                st.session_state.last_file_id = file_id
+                st.session_state.confirmed_pitchers_summary = []
+                st.sidebar.success(f"Loaded {len(st.session_state.mlb_df)} players across {st.session_state.mlb_df['Team'].nunique()} teams.")
+            except Exception as e:
+                st.sidebar.error(f"Error parsing CSV: {e}")
+                st.session_state.mlb_df = get_sample_slate()
 else:
-  if len(st.session_state.mlb_df) > 50 and st.session_state.last_file_id is not None:
-    st.session_state.mlb_df = get_sample_slate()
-    st.session_state.last_file_id = None
-    st.session_state.confirmed_pitchers_summary = []
+    if len(st.session_state.mlb_df) > 50 and st.session_state.last_file_id is not None:
+        st.session_state.mlb_df = get_sample_slate()
+        st.session_state.last_file_id = None
+        st.session_state.confirmed_pitchers_summary = []
 
 df = st.session_state.mlb_df
 detected_date = extract_slate_date_from_df(df)
@@ -939,41 +503,29 @@ st.sidebar.markdown("---")
 st.sidebar.header("🔄 Live MLB Lineup & SP Sync")
 selected_date = st.sidebar.date_input("Slate Date", detected_date)
 
-if st.sidebar.button(
-    "⚡ Sync Confirmed MLB Lineups & SPs",
-    type="secondary",
-    use_container_width=True,
-):
-  with st.spinner(
-      f"Fetching MLB official starting cards for {selected_date}..."
-  ):
-    date_str = selected_date.strftime("%Y-%m-%d")
-    c_lineups, p_pitchers, err = fetch_mlb_confirmed_lineups(date_str)
-
-    if err:
-      st.sidebar.error(err)
-    elif not c_lineups and not p_pitchers:
-      st.sidebar.warning(f"No games found on schedule for {date_str}.")
-    else:
-      updated_df, matched_pitchers, n_conf_teams, n_proj_teams = (
-          apply_two_tier_sync(st.session_state.mlb_df, c_lineups, p_pitchers)
-      )
-      st.session_state.mlb_df = updated_df
-      st.session_state.confirmed_pitchers_summary = matched_pitchers
-      st.sidebar.success(
-          f"✅ Synced! {n_conf_teams} Teams Confirmed 🟢 | {n_proj_teams} Teams"
-          f" Projected 🟡 | {len(matched_pitchers)} SPs Locked."
-      )
+if st.sidebar.button("⚡ Sync Confirmed MLB Lineups & SPs", type="secondary", use_container_width=True):
+    with st.spinner(f"Fetching MLB official starting cards for {selected_date}..."):
+        date_str = selected_date.strftime("%Y-%m-%d")
+        c_lineups, p_pitchers, err = fetch_mlb_confirmed_lineups(date_str)
+        
+        if err:
+            st.sidebar.error(err)
+        elif not c_lineups and not p_pitchers:
+            st.sidebar.warning(f"No games found on schedule for {date_str}.")
+        else:
+            updated_df, matched_pitchers, n_conf_teams, n_proj_teams = apply_two_tier_sync(
+                st.session_state.mlb_df, c_lineups, p_pitchers
+            )
+            st.session_state.mlb_df = updated_df
+            st.session_state.confirmed_pitchers_summary = matched_pitchers
+            st.sidebar.success(f"✅ Synced! {n_conf_teams} Teams Confirmed 🟢 | {n_proj_teams} Teams Projected 🟡 | {len(matched_pitchers)} SPs Locked.")
 
 df = st.session_state.mlb_df
 
 if st.session_state.confirmed_pitchers_summary:
-  with st.sidebar.expander("✅ Active Starting Pitcher Pool", expanded=True):
-    for team, sp_name, status_tag in st.session_state.confirmed_pitchers_summary:
-      st.markdown(
-          f"- **{team}**: {sp_name} <small>({status_tag})</small>",
-          unsafe_allow_html=True,
-      )
+    with st.sidebar.expander("✅ Active Starting Pitcher Pool", expanded=True):
+        for team, sp_name, status_tag in st.session_state.confirmed_pitchers_summary:
+            st.markdown(f"- **{team}**: {sp_name} <small>({status_tag})</small>", unsafe_allow_html=True)
 
 # -----------------------------------------------------------------------------
 # 10. Sidebar Optimization & Matchup Controls
@@ -983,614 +535,415 @@ st.sidebar.header("⚙️ Optimization & Stacking Rules")
 
 stack_strategy = st.sidebar.selectbox(
     "Stack Architecture",
-    [
-        "5-3 Stack (Primary + Secondary)",
-        "5-2 Stack",
-        "4-4 Stack",
-        "Unconstrained (No Stacking)",
-    ],
-    index=0,
+    ["5-3 Stack (Primary + Secondary)", "5-2 Stack", "4-4 Stack", "Unconstrained (No Stacking)"],
+    index=0
 )
 
 col_s1, col_s2 = st.sidebar.columns(2)
 with col_s1:
-  min_sal = st.sidebar.number_input(
-      "Min Salary ($)",
-      value=48500,
-      min_value=40000,
-      max_value=50000,
-      step=100,
-  )
+    min_sal = st.sidebar.number_input("Min Salary ($)", value=48500, min_value=40000, max_value=50000, step=100)
 with col_s2:
-  max_sal = st.sidebar.number_input(
-      "Max Salary ($)",
-      value=49900,
-      min_value=45000,
-      max_value=50000,
-      step=100,
-  )
+    max_sal = st.sidebar.number_input("Max Salary ($)", value=49900, min_value=45000, max_value=50000, step=100)
 
-no_pitcher_vs_hitter = st.sidebar.checkbox(
-    "Block Pitchers vs Opposing Hitters", value=True
-)
-no_opposing_pitchers = st.sidebar.checkbox(
-    "Block Opposing Pitchers (Same Game)", value=True
-)
-starters_only = st.sidebar.checkbox(
-    "Strict Starters Only (Active Lineups & Depth Charts Only)", value=True
-)
+no_pitcher_vs_hitter = st.sidebar.checkbox("Block Pitchers vs Opposing Hitters", value=True)
+no_opposing_pitchers = st.sidebar.checkbox("Block Opposing Pitchers (Same Game)", value=True)
+starters_only = st.sidebar.checkbox("Strict Starters Only (Active Lineups & Depth Charts Only)", value=True)
 
 # Matchup Conditioning Rules
 st.sidebar.markdown("---")
-st.sidebar.header("⚔️ Matchup Conditioning & Ace Filters")
+st.sidebar.header("⚔️ Matchup Conditioning & Pitcher Filters")
 
-use_matchup_projections = st.sidebar.checkbox(
-    "Apply Dynamic Matchup Multipliers (Vegas + SP Tier)", value=True
-)
+use_matchup_projections = st.sidebar.checkbox("Apply Dynamic Matchup Multipliers (Vegas + SP Tier)", value=True)
 
-limit_bats_vs_aces = st.sidebar.checkbox(
-    "Limit Hitters vs Elite Pitchers (Aces)", value=True
-)
-ace_threshold = st.sidebar.number_input(
-    "Elite Pitcher Salary Threshold ($)",
-    value=9500,
-    min_value=7000,
-    max_value=13000,
-    step=100,
-)
-max_bats_vs_ace_val = st.sidebar.selectbox(
-    "Max Hitters Allowed vs Elite Pitchers", [0, 1, 2], index=1
-)
+# Tough SP Filter (Complete block or cap vs Aces/Tough Arms)
+limit_bats_vs_aces = st.sidebar.checkbox("🛡️ Restrict Hitters vs Tough Pitchers", value=True)
+ace_threshold = st.sidebar.number_input("Tough Pitcher Salary Cutoff ($)", value=7800, min_value=6000, max_value=13000, step=100, help="Any starting pitcher with salary >= this threshold will have opposing hitters capped or blocked.")
+max_bats_vs_ace_val = st.sidebar.selectbox("Max Hitters Allowed vs Tough Pitchers", [0, 1, 2], index=0, help="Set to 0 to completely block any hitters facing a tough pitcher.")
 
-target_favorable_sps = st.sidebar.checkbox(
-    "Target Stacks vs Vulnerable Pitchers", value=False
-)
-favorable_sp_threshold = st.sidebar.number_input(
-    "Vulnerable Pitcher Salary Threshold ($)",
-    value=7200,
-    min_value=5000,
-    max_value=9000,
-    step=100,
-)
+# Vulnerable SP Targeting (Forces Primary AND/OR Secondary stacks against cheap pitchers)
+target_favorable_sps = st.sidebar.checkbox("🎯 Target Stacks vs Vulnerable Pitchers", value=False)
+favorable_sp_threshold = st.sidebar.number_input("Vulnerable Pitcher Salary Cutoff ($)", value=7200, min_value=5000, max_value=9000, step=100, help="Forces stacks to strictly target teams facing opposing pitchers with salary <= this threshold.")
+stack_enforcement_scope = st.sidebar.selectbox("Apply Vulnerable SP Stack Rule To:", ["Both Primary & Secondary Stacks", "Primary Stack Only"], index=0)
 
 st.sidebar.markdown("---")
 st.sidebar.header("🎲 Tournament Diversity & Ownership")
-max_roster_own = st.sidebar.slider(
-    "Max Cumulative Ownership (%)",
-    min_value=80.0,
-    max_value=350.0,
-    value=260.0,
-    step=5.0,
-)
-num_lineups = st.sidebar.slider(
-    "Lineups to Generate", min_value=1, max_value=10, value=3, step=1
-)
-max_overlap = st.sidebar.slider(
-    "Max Player Overlap Between Lineups",
-    min_value=3,
-    max_value=8,
-    value=6,
-    step=1,
-)
-
+max_roster_own = st.sidebar.slider("Max Cumulative Ownership (%)", min_value=80.0, max_value=350.0, value=260.0, step=5.0)
+num_lineups = st.sidebar.slider("Lineups to Generate", min_value=1, max_value=10, value=3, step=1)
+max_overlap = st.sidebar.slider("Max Player Overlap Between Lineups", min_value=3, max_value=8, value=6, step=1)
 
 # -----------------------------------------------------------------------------
 # 11. Fast PuLP MILP Optimization Core
 # -----------------------------------------------------------------------------
 def optimize_dk_mlb(
-    df_input,
-    stack_type,
-    min_salary,
-    max_salary,
-    block_p_h,
-    block_p_p,
+    df_input, stack_type, min_salary, max_salary, 
+    block_p_h, block_p_p, 
     apply_matchup_boost,
-    limit_aces,
-    ace_sal_cutoff,
-    max_bats_vs_ace,
-    target_favorable,
-    fav_sp_cutoff,
-    max_own,
-    num_lineups_to_gen,
-    max_overlap_val,
-    enforce_starters=True,
+    limit_aces, ace_sal_cutoff, max_bats_vs_ace,
+    target_favorable, fav_sp_cutoff, stack_scope,
+    max_own, num_lineups_to_gen, max_overlap_val, enforce_starters=True
 ):
-  df_raw = df_input.copy()
+    df_raw = df_input.copy()
+    
+    # 1. Apply dynamic matchup multiplier adjustments if checked
+    if apply_matchup_boost:
+        df_raw = apply_dynamic_matchup_adjustments(df_raw)
 
-  # 1. Apply dynamic matchup multiplier adjustments if checked
-  if apply_matchup_boost:
-    df_raw = apply_dynamic_matchup_adjustments(df_raw)
-
-  # 2. Filter out all inactive or zero-projection players
-  df_active = df_raw[df_raw["Projection"] > 0].copy().reset_index(drop=True)
-  df_active["Position"] = (
-      df_active["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
-  )
-
-  # 3. Pitcher Filtering: ONLY 1 SP per team
-  pitchers_sub = df_active[df_active["Position"] == "P"].copy()
-  if enforce_starters and pitchers_sub["IsConfirmedStarter"].any():
-    pitchers_filtered = pitchers_sub[
-        pitchers_sub["IsConfirmedStarter"]
-    ].reset_index(drop=True)
-  else:
-    p_list = []
-    for t in pitchers_sub["Team"].unique():
-      t_p = pitchers_sub[pitchers_sub["Team"] == t].sort_values(
-          by=["Projection", "Salary"], ascending=[False, False]
-      )
-      if not t_p.empty:
-        p_list.append(t_p.head(1))
-    pitchers_filtered = (
-        pd.concat(p_list).reset_index(drop=True) if p_list else pd.DataFrame()
-    )
-
-  # 4. Hitters Filtering: ONLY Batting Orders 1-9 (Confirmed or Projected)
-  hitters_sub = df_active[df_active["Position"] != "P"].copy()
-  hitters_list = []
-  for t in hitters_sub["Team"].unique():
-    t_h = hitters_sub[hitters_sub["Team"] == t]
-    if (
-        enforce_starters
-        and "BattingOrder" in t_h.columns
-        and (t_h["BattingOrder"] > 0).any()
-    ):
-      valid_b = t_h[t_h["BattingOrder"].between(1, 9)].sort_values(
-          by="BattingOrder"
-      )
-      if len(valid_b) < 9:
-        rem = t_h[~t_h.index.isin(valid_b.index)].sort_values(
-            by="Projection", ascending=False
-        )
-        t_h_sel = pd.concat([valid_b, rem]).head(9)
-      else:
-        t_h_sel = valid_b.head(9)
+    # 2. Filter out all inactive or zero-projection players
+    df_active = df_raw[df_raw["Projection"] > 0].copy().reset_index(drop=True)
+    df_active["Position"] = df_active["Position"].astype(str).str.strip().replace({"SP": "P", "RP": "P"})
+    
+    # 3. Pitcher Filtering: ONLY 1 SP per team
+    pitchers_sub = df_active[df_active["Position"] == "P"].copy()
+    if enforce_starters and pitchers_sub["IsConfirmedStarter"].any():
+        pitchers_filtered = pitchers_sub[pitchers_sub["IsConfirmedStarter"]].reset_index(drop=True)
     else:
-      t_h_sel = t_h.sort_values(
-          by=["Projection", "Salary"], ascending=[False, False]
-      ).head(9)
+        p_list = []
+        for t in pitchers_sub["Team"].unique():
+            t_p = pitchers_sub[pitchers_sub["Team"] == t].sort_values(by=["Projection", "Salary"], ascending=[False, False])
+            if not t_p.empty:
+                p_list.append(t_p.head(1))
+        pitchers_filtered = pd.concat(p_list).reset_index(drop=True) if p_list else pd.DataFrame()
 
-    if not t_h_sel.empty:
-      hitters_list.append(t_h_sel)
-
-  hitters_filtered = (
-      pd.concat(hitters_list).reset_index(drop=True)
-      if hitters_list
-      else pd.DataFrame()
-  )
-
-  df_players = pd.concat([pitchers_filtered, hitters_filtered]).reset_index(
-      drop=True
-  )
-  n_players = len(df_players)
-
-  if n_players == 0:
-    return []
-
-  slots = ["P1", "P2", "C", "1B", "2B", "3B", "SS", "OF1", "OF2", "OF3"]
-  teams = df_players["Team"].unique().tolist()
-
-  def is_eligible(pos_str, slot):
-    pos = str(pos_str).split("/")
-    if slot in ["P1", "P2"]:
-      return "P" in pos
-    elif slot.startswith("OF"):
-      return "OF" in pos
-    else:
-      return slot in pos
-
-  generated_lineups = []
-  previous_lineup_sets = []
-
-  for l_idx in range(num_lineups_to_gen):
-    prob = LpProblem(f"DK_MLB_SingleEntry_{l_idx+1}", LpMaximize)
-
-    x = {}
-    for p_idx in range(n_players):
-      pos_str = str(df_players.loc[p_idx, "Position"])
-      for slot in slots:
-        if is_eligible(pos_str, slot):
-          x[p_idx, slot] = LpVariable(f"x_{p_idx}_{slot}", cat="Binary")
-
-    y = {
-        p_idx: LpVariable(f"y_{p_idx}", cat="Binary")
-        for p_idx in range(n_players)
-    }
-
-    for p_idx in range(n_players):
-      eligible_slots = [slot for slot in slots if (p_idx, slot) in x]
-      prob += lpSum([x[p_idx, slot] for slot in eligible_slots]) == y[p_idx]
-
-    for slot in slots:
-      eligible_players = [
-          p_idx for p_idx in range(n_players) if (p_idx, slot) in x
-      ]
-      prob += lpSum([x[p_idx, slot] for p_idx in eligible_players]) == 1
-
-    prob += lpSum([y[p_idx] for p_idx in range(n_players)]) == 10
-    prob += (
-        lpSum([
-            df_players.loc[p_idx, "Salary"] * y[p_idx]
-            for p_idx in range(n_players)
-        ])
-        <= max_salary
-    )
-    prob += (
-        lpSum([
-            df_players.loc[p_idx, "Salary"] * y[p_idx]
-            for p_idx in range(n_players)
-        ])
-        >= min_salary
-    )
-
-    if "Ownership" in df_players.columns:
-      prob += (
-          lpSum([
-              df_players.loc[p_idx, "Ownership"] * y[p_idx]
-              for p_idx in range(n_players)
-          ])
-          <= max_own
-      )
-
-    # Anti-Correlation Constraints
-    hitter_indices = [
-        p_idx
-        for p_idx in range(n_players)
-        if df_players.loc[p_idx, "Position"] != "P"
-    ]
-    pitcher_indices = [
-        p_idx
-        for p_idx in range(n_players)
-        if "P" in str(df_players.loc[p_idx, "Position"]).split("/")
-    ]
-
-    if block_p_h:
-      for p_idx in pitcher_indices:
-        p_opp = df_players.loc[p_idx, "Opponent"]
-        opp_hitters = [
-            h_idx
-            for h_idx in hitter_indices
-            if df_players.loc[h_idx, "Team"] == p_opp
-        ]
-        for h_idx in opp_hitters:
-          prob += y[p_idx] + y[h_idx] <= 1
-
-    if block_p_p:
-      for p1 in pitcher_indices:
-        for p2 in pitcher_indices:
-          if (
-              p1 < p2
-              and df_players.loc[p1, "Team"] == df_players.loc[p2, "Opponent"]
-          ):
-            prob += y[p1] + y[p2] <= 1
-
-    # MATCHUP RULE 1: Limit Hitters vs Elite Pitchers (Aces)
-    if limit_aces:
-      for p_idx in pitcher_indices:
-        if df_players.loc[p_idx, "Salary"] >= ace_sal_cutoff:
-          p_opp = df_players.loc[p_idx, "Opponent"]
-          opp_hitters = [
-              h_idx
-              for h_idx in hitter_indices
-              if df_players.loc[h_idx, "Team"] == p_opp
-          ]
-          if opp_hitters:
-            prob += lpSum([y[h_idx] for h_idx in opp_hitters]) <= max_bats_vs_ace
-
-    # Team Stacking Logic
-    if stack_type != "Unconstrained (No Stacking)":
-      primary_indicators = {
-          t: LpVariable(f"prim_{t}", cat="Binary") for t in teams
-      }
-
-      # MATCHUP RULE 2: Force Primary Stack against Vulnerable SPs
-      if target_favorable:
-        favorable_stack_teams = []
-        for t in teams:
-          opp_sp = df_players[
-              (df_players["Position"] == "P") & (df_players["Opponent"] == t)
-          ]
-          if not opp_sp.empty and opp_sp.iloc[0]["Salary"] <= fav_sp_cutoff:
-            favorable_stack_teams.append(t)
-
-        if favorable_stack_teams:
-          prob += (
-              lpSum([primary_indicators[t] for t in favorable_stack_teams]) == 1
-          )
+    # 4. Hitters Filtering: ONLY Batting Orders 1-9 (Confirmed or Projected)
+    hitters_sub = df_active[df_active["Position"] != "P"].copy()
+    hitters_list = []
+    for t in hitters_sub["Team"].unique():
+        t_h = hitters_sub[hitters_sub["Team"] == t]
+        if enforce_starters and "BattingOrder" in t_h.columns and (t_h["BattingOrder"] > 0).any():
+            valid_b = t_h[t_h["BattingOrder"].between(1, 9)].sort_values(by="BattingOrder")
+            if len(valid_b) < 9:
+                rem = t_h[~t_h.index.isin(valid_b.index)].sort_values(by="Projection", ascending=False)
+                t_h_sel = pd.concat([valid_b, rem]).head(9)
+            else:
+                t_h_sel = valid_b.head(9)
         else:
-          prob += lpSum([primary_indicators[t] for t in teams]) == 1
-      else:
-        prob += lpSum([primary_indicators[t] for t in teams]) == 1
+            t_h_sel = t_h.sort_values(by=["Projection", "Salary"], ascending=[False, False]).head(9)
+            
+        if not t_h_sel.empty:
+            hitters_list.append(t_h_sel)
 
-      if stack_type == "5-3 Stack (Primary + Secondary)":
-        sec_indicators = {t: LpVariable(f"sec_{t}", cat="Binary") for t in teams}
-        prob += lpSum([sec_indicators[t] for t in teams]) == 1
-        for t in teams:
-          prob += primary_indicators[t] + sec_indicators[t] <= 1
-          t_hitters = [
-              p_idx
-              for p_idx in hitter_indices
-              if df_players.loc[p_idx, "Team"] == t
-          ]
-          prob += (
-              lpSum([y[p_idx] for p_idx in t_hitters])
-              >= 5 * primary_indicators[t] + 3 * sec_indicators[t]
-          )
-          prob += (
-              lpSum([y[p_idx] for p_idx in t_hitters])
-              <= 5 * primary_indicators[t] + 3 * sec_indicators[t]
-          )
+    hitters_filtered = pd.concat(hitters_list).reset_index(drop=True) if hitters_list else pd.DataFrame()
 
-      elif stack_type == "5-2 Stack":
-        sec_indicators = {t: LpVariable(f"sec_{t}", cat="Binary") for t in teams}
-        prob += lpSum([sec_indicators[t] for t in teams]) == 1
-        for t in teams:
-          prob += primary_indicators[t] + sec_indicators[t] <= 1
-          t_hitters = [
-              p_idx
-              for p_idx in hitter_indices
-              if df_players.loc[p_idx, "Team"] == t
-          ]
-          prob += (
-              lpSum([y[p_idx] for p_idx in t_hitters])
-              >= 5 * primary_indicators[t] + 2 * sec_indicators[t]
-          )
-          prob += (
-              lpSum([y[p_idx] for p_idx in t_hitters])
-              <= 5 * primary_indicators[t] + 2 * sec_indicators[t] + 1
-          )
+    df_players = pd.concat([pitchers_filtered, hitters_filtered]).reset_index(drop=True)
+    n_players = len(df_players)
+    
+    if n_players == 0:
+        return []
 
-      elif stack_type == "4-4 Stack":
-        sec_indicators = {t: LpVariable(f"sec_{t}", cat="Binary") for t in teams}
-        prob += lpSum([sec_indicators[t] for t in teams]) == 1
-        for t in teams:
-          prob += primary_indicators[t] + sec_indicators[t] <= 1
-          t_hitters = [
-              p_idx
-              for p_idx in hitter_indices
-              if df_players.loc[p_idx, "Team"] == t
-          ]
-          prob += (
-              lpSum([y[p_idx] for p_idx in t_hitters])
-              >= 4 * primary_indicators[t] + 4 * sec_indicators[t]
-          )
-          prob += (
-              lpSum([y[p_idx] for p_idx in t_hitters])
-              <= 4 * primary_indicators[t] + 4 * sec_indicators[t]
-          )
-    else:
-      for t in teams:
-        t_hitters = [
-            p_idx
-            for p_idx in hitter_indices
-            if df_players.loc[p_idx, "Team"] == t
-        ]
-        prob += lpSum([y[p_idx] for p_idx in t_hitters]) <= 5
+    slots = ["P1", "P2", "C", "1B", "2B", "3B", "SS", "OF1", "OF2", "OF3"]
+    teams = df_players["Team"].unique().tolist()
+    
+    # Pre-calculate opposing starting pitcher map for all teams
+    opp_sp_map = {}
+    p_df = df_players[df_players["Position"] == "P"]
+    for t in teams:
+        t_opps = df_players[df_players["Team"] == t]["Opponent"].dropna().unique()
+        if len(t_opps) > 0:
+            opp_t = t_opps[0]
+            opp_p_rows = p_df[p_df["Team"] == opp_t]
+            if not opp_p_rows.empty:
+                opp_sp_map[t] = {
+                    "SP_Name": opp_p_rows.iloc[0]["Name"],
+                    "SP_Salary": opp_p_rows.iloc[0]["Salary"],
+                    "SP_Team": opp_t
+                }
 
-    # Lineup Overlap Constraint
-    for prev_set in previous_lineup_sets:
-      prob += lpSum([y[p_idx] for p_idx in prev_set]) <= max_overlap_val
+    def is_eligible(pos_str, slot):
+        pos = str(pos_str).split("/")
+        if slot in ["P1", "P2"]:
+            return "P" in pos
+        elif slot.startswith("OF"):
+            return "OF" in pos
+        else:
+            return slot in pos
 
-    prob += lpSum([
-        df_players.loc[p_idx, "Projection"] * y[p_idx]
-        for p_idx in range(n_players)
-    ])
-    solver = PULP_CBC_CMD(msg=False, timeLimit=10, gapRel=0.01)
-    status = prob.solve(solver)
+    generated_lineups = []
+    previous_lineup_sets = []
 
-    if LpStatus[status] != "Optimal":
-      st.warning(f"Lineup {l_idx+1}: Infeasible solution under constraints.")
-      break
+    for l_idx in range(num_lineups_to_gen):
+        prob = LpProblem(f"DK_MLB_SingleEntry_{l_idx+1}", LpMaximize)
 
-    current_lineup_indices = [
-        p_idx for p_idx in range(n_players) if y[p_idx].varValue > 0.5
-    ]
-    previous_lineup_sets.append(current_lineup_indices)
+        x = {}
+        for p_idx in range(n_players):
+            pos_str = str(df_players.loc[p_idx, "Position"])
+            for slot in slots:
+                if is_eligible(pos_str, slot):
+                    x[p_idx, slot] = LpVariable(f"x_{p_idx}_{slot}", cat="Binary")
 
-    lineup_records = []
-    for p_idx in current_lineup_indices:
-      assigned_slot = [
-          slot
-          for slot in slots
-          if (p_idx, slot) in x and x[p_idx, slot].varValue > 0.5
-      ][0]
-      lineup_records.append({
-          "Slot": (
-              assigned_slot.replace("1", "").replace("2", "").replace("3", "")
-          ),
-          "Name": df_players.loc[p_idx, "Name"],
-          "Team": df_players.loc[p_idx, "Team"],
-          "Opponent": df_players.loc[p_idx, "Opponent"],
-          "Pos": df_players.loc[p_idx, "Position"],
-          "Salary": df_players.loc[p_idx, "Salary"],
-          "Proj": df_players.loc[p_idx, "Projection"],
-          "Own%": (
-              df_players.loc[p_idx, "Ownership"]
-              if "Ownership" in df_players.columns
-              else 0.0
-          ),
-          "Order": (
-              df_players.loc[p_idx, "BattingOrder"]
-              if "BattingOrder" in df_players.columns
-              else "-"
-          ),
-          "Status": (
-              df_players.loc[p_idx, "LineupStatus"]
-              if "LineupStatus" in df_players.columns
-              else "PROJECTED 🟡"
-          ),
-      })
+        y = {p_idx: LpVariable(f"y_{p_idx}", cat="Binary") for p_idx in range(n_players)}
 
-    slot_order = {"P": 1, "C": 2, "1B": 3, "2B": 4, "3B": 5, "SS": 6, "OF": 7}
-    df_lineup = pd.DataFrame(lineup_records)
-    df_lineup["SortKey"] = df_lineup["Slot"].map(slot_order)
-    df_lineup = (
-        df_lineup.sort_values(by="SortKey")
-        .drop(columns=["SortKey"])
-        .reset_index(drop=True)
-    )
-    generated_lineups.append(df_lineup)
+        for p_idx in range(n_players):
+            eligible_slots = [slot for slot in slots if (p_idx, slot) in x]
+            prob += lpSum([x[p_idx, slot] for slot in eligible_slots]) == y[p_idx]
 
-  return generated_lineups
+        for slot in slots:
+            eligible_players = [p_idx for p_idx in range(n_players) if (p_idx, slot) in x]
+            prob += lpSum([x[p_idx, slot] for p_idx in eligible_players]) == 1
 
+        prob += lpSum([y[p_idx] for p_idx in range(n_players)]) == 10
+        prob += lpSum([df_players.loc[p_idx, "Salary"] * y[p_idx] for p_idx in range(n_players)]) <= max_salary
+        prob += lpSum([df_players.loc[p_idx, "Salary"] * y[p_idx] for p_idx in range(n_players)]) >= min_salary
+
+        if "Ownership" in df_players.columns:
+            prob += lpSum([df_players.loc[p_idx, "Ownership"] * y[p_idx] for p_idx in range(n_players)]) <= max_own
+
+        # Anti-Correlation Constraints
+        hitter_indices = [p_idx for p_idx in range(n_players) if df_players.loc[p_idx, "Position"] != "P"]
+        pitcher_indices = [p_idx for p_idx in range(n_players) if "P" in str(df_players.loc[p_idx, "Position"]).split("/")]
+
+        if block_p_h:
+            for p_idx in pitcher_indices:
+                p_opp = df_players.loc[p_idx, "Opponent"]
+                opp_hitters = [h_idx for h_idx in hitter_indices if df_players.loc[h_idx, "Team"] == p_opp]
+                for h_idx in opp_hitters:
+                    prob += y[p_idx] + y[h_idx] <= 1
+
+        if block_p_p:
+            for p1 in pitcher_indices:
+                for p2 in pitcher_indices:
+                    if p1 < p2 and df_players.loc[p1, "Team"] == df_players.loc[p2, "Opponent"]:
+                        prob += y[p1] + y[p2] <= 1
+
+        # MATCHUP RULE 1: Restrict Hitters vs Tough Pitchers (SP Salary >= Cutoff)
+        if limit_aces:
+            for p_idx in pitcher_indices:
+                if df_players.loc[p_idx, "Salary"] >= ace_sal_cutoff:
+                    p_opp = df_players.loc[p_idx, "Opponent"]
+                    opp_hitters = [h_idx for h_idx in hitter_indices if df_players.loc[h_idx, "Team"] == p_opp]
+                    if opp_hitters:
+                        prob += lpSum([y[h_idx] for h_idx in opp_hitters]) <= max_bats_vs_ace
+
+        # Team Stacking Logic
+        if stack_type != "Unconstrained (No Stacking)":
+            primary_indicators = {t: LpVariable(f"prim_{t}", cat="Binary") for t in teams}
+            
+            # MATCHUP RULE 2: Target Stacks vs Vulnerable Pitchers
+            favorable_teams = []
+            if target_favorable:
+                for t in teams:
+                    if t in opp_sp_map and opp_sp_map[t]["SP_Salary"] <= fav_sp_cutoff:
+                        favorable_teams.append(t)
+                        
+                if favorable_teams:
+                    prob += lpSum([primary_indicators[t] for t in favorable_teams]) == 1
+                else:
+                    prob += lpSum([primary_indicators[t] for t in teams]) == 1
+            else:
+                prob += lpSum([primary_indicators[t] for t in teams]) == 1
+
+            if stack_type == "5-3 Stack (Primary + Secondary)":
+                sec_indicators = {t: LpVariable(f"sec_{t}", cat="Binary") for t in teams}
+                
+                # Apply favorable constraint to secondary stack if requested
+                if target_favorable and stack_scope == "Both Primary & Secondary Stacks" and favorable_teams:
+                    prob += lpSum([sec_indicators[t] for t in favorable_teams]) == 1
+                else:
+                    prob += lpSum([sec_indicators[t] for t in teams]) == 1
+
+                for t in teams:
+                    prob += primary_indicators[t] + sec_indicators[t] <= 1
+                    t_hitters = [p_idx for p_idx in hitter_indices if df_players.loc[p_idx, "Team"] == t]
+                    prob += lpSum([y[p_idx] for p_idx in t_hitters]) >= 5 * primary_indicators[t] + 3 * sec_indicators[t]
+                    prob += lpSum([y[p_idx] for p_idx in t_hitters]) <= 5 * primary_indicators[t] + 3 * sec_indicators[t]
+
+            elif stack_type == "5-2 Stack":
+                sec_indicators = {t: LpVariable(f"sec_{t}", cat="Binary") for t in teams}
+                
+                if target_favorable and stack_scope == "Both Primary & Secondary Stacks" and favorable_teams:
+                    prob += lpSum([sec_indicators[t] for t in favorable_teams]) == 1
+                else:
+                    prob += lpSum([sec_indicators[t] for t in teams]) == 1
+
+                for t in teams:
+                    prob += primary_indicators[t] + sec_indicators[t] <= 1
+                    t_hitters = [p_idx for p_idx in hitter_indices if df_players.loc[p_idx, "Team"] == t]
+                    prob += lpSum([y[p_idx] for p_idx in t_hitters]) >= 5 * primary_indicators[t] + 2 * sec_indicators[t]
+                    prob += lpSum([y[p_idx] for p_idx in t_hitters]) <= 5 * primary_indicators[t] + 2 * sec_indicators[t] + 1
+
+            elif stack_type == "4-4 Stack":
+                sec_indicators = {t: LpVariable(f"sec_{t}", cat="Binary") for t in teams}
+                
+                if target_favorable and stack_scope == "Both Primary & Secondary Stacks" and favorable_teams:
+                    prob += lpSum([sec_indicators[t] for t in favorable_teams]) == 1
+                else:
+                    prob += lpSum([sec_indicators[t] for t in teams]) == 1
+
+                for t in teams:
+                    prob += primary_indicators[t] + sec_indicators[t] <= 1
+                    t_hitters = [p_idx for p_idx in hitter_indices if df_players.loc[p_idx, "Team"] == t]
+                    prob += lpSum([y[p_idx] for p_idx in t_hitters]) >= 4 * primary_indicators[t] + 4 * sec_indicators[t]
+                    prob += lpSum([y[p_idx] for p_idx in t_hitters]) <= 4 * primary_indicators[t] + 4 * sec_indicators[t]
+        else:
+            for t in teams:
+                t_hitters = [p_idx for p_idx in hitter_indices if df_players.loc[p_idx, "Team"] == t]
+                prob += lpSum([y[p_idx] for p_idx in t_hitters]) <= 5
+
+        # Lineup Overlap Constraint
+        for prev_set in previous_lineup_sets:
+            prob += lpSum([y[p_idx] for p_idx in prev_set]) <= max_overlap_val
+
+        prob += lpSum([df_players.loc[p_idx, "Projection"] * y[p_idx] for p_idx in range(n_players)])
+        solver = PULP_CBC_CMD(msg=False, timeLimit=10, gapRel=0.01)
+        status = prob.solve(solver)
+
+        if LpStatus[status] != "Optimal":
+            st.warning(f"Lineup {l_idx+1}: Infeasible solution under constraints.")
+            break
+
+        current_lineup_indices = [p_idx for p_idx in range(n_players) if y[p_idx].varValue > 0.5]
+        previous_lineup_sets.append(current_lineup_indices)
+
+        lineup_records = []
+        for p_idx in current_lineup_indices:
+            assigned_slot = [slot for slot in slots if (p_idx, slot) in x and x[p_idx, slot].varValue > 0.5][0]
+            lineup_records.append({
+                "Slot": assigned_slot.replace("1", "").replace("2", "").replace("3", ""),
+                "Name": df_players.loc[p_idx, "Name"],
+                "Team": df_players.loc[p_idx, "Team"],
+                "Opponent": df_players.loc[p_idx, "Opponent"],
+                "Pos": df_players.loc[p_idx, "Position"],
+                "Salary": df_players.loc[p_idx, "Salary"],
+                "Proj": df_players.loc[p_idx, "Projection"],
+                "Own%": df_players.loc[p_idx, "Ownership"] if "Ownership" in df_players.columns else 0.0,
+                "Order": df_players.loc[p_idx, "BattingOrder"] if "BattingOrder" in df_players.columns else "-",
+                "Status": df_players.loc[p_idx, "LineupStatus"] if "LineupStatus" in df_players.columns else "PROJECTED 🟡"
+            })
+
+        slot_order = {"P": 1, "C": 2, "1B": 3, "2B": 4, "3B": 5, "SS": 6, "OF": 7}
+        df_lineup = pd.DataFrame(lineup_records)
+        df_lineup["SortKey"] = df_lineup["Slot"].map(slot_order)
+        df_lineup = df_lineup.sort_values(by="SortKey").drop(columns=["SortKey"]).reset_index(drop=True)
+        generated_lineups.append(df_lineup)
+
+    return generated_lineups
 
 # -----------------------------------------------------------------------------
 # 12. Interactive Tabs & Results UI
 # -----------------------------------------------------------------------------
-tab_opt, tab_heat, tab_data = st.tabs(
-    ["🚀 Lineup Optimizer", "🔥 Matchup Heatmap & Slate Schedule", "📋 Slate Data"]
-)
+tab_opt, tab_heat, tab_data = st.tabs(["🚀 Lineup Optimizer", "🔥 Matchup Heatmap & Slate Schedule", "📋 Slate Data"])
 
 with tab_data:
-  st.subheader("Current Slate Roster Pool")
-  st.dataframe(df, use_container_width=True)
+    st.subheader("Current Slate Roster Pool")
+    st.dataframe(df, use_container_width=True)
 
 with tab_heat:
-  st.subheader("Vegas Implied Runs & Batting Order Heatmap (All Slate Teams)")
-  df_heat = df.copy()
-  df_heat = df_heat[
-      (df_heat["BattingOrder"].between(1, 9)) | (df_heat["Position"] == "P")
-  ]
+    st.subheader("Vegas Implied Runs & Batting Order Heatmap (All Slate Teams)")
+    df_heat = df.copy()
+    df_heat = df_heat[(df_heat["BattingOrder"].between(1, 9)) | (df_heat["Position"] == "P")]
 
-  if (
-      not df_heat.empty
-      and "Team" in df_heat.columns
-      and "BattingOrder" in df_heat.columns
-  ):
-    pivot_proj = (
-        df_heat[df_heat["Position"] != "P"]
-        .pivot_table(
-            index="Team",
-            columns="BattingOrder",
-            values="Projection",
-            aggfunc="mean",
+    if not df_heat.empty and "Team" in df_heat.columns and "BattingOrder" in df_heat.columns:
+        pivot_proj = df_heat[df_heat["Position"] != "P"].pivot_table(
+            index="Team", columns="BattingOrder", values="Projection", aggfunc="mean"
+        ).fillna(0)
+
+        # Ensure all 9 order slots exist as columns
+        for o_num in range(1, 10):
+            if o_num not in pivot_proj.columns:
+                pivot_proj[o_num] = 0.0
+        pivot_proj = pivot_proj[[1, 2, 3, 4, 5, 6, 7, 8, 9]].sort_index()
+
+        # Dynamic height scaling so Plotly never truncates teams
+        calc_height = max(450, len(pivot_proj) * 32)
+
+        fig1 = px.imshow(
+            pivot_proj,
+            labels=dict(x="Batting Order Slot", y="Team", color="Proj FPTS"),
+            x=[f"#{c}" for c in pivot_proj.columns],
+            y=pivot_proj.index,
+            color_continuous_scale="Viridis",
+            text_auto=".1f",
+            aspect="auto"
         )
-        .fillna(0)
-    )
-
-    for o_num in range(1, 10):
-      if o_num not in pivot_proj.columns:
-        pivot_proj[o_num] = 0.0
-    pivot_proj = pivot_proj[[1, 2, 3, 4, 5, 6, 7, 8, 9]].sort_index()
-
-    calc_height = max(450, len(pivot_proj) * 32)
-
-    fig1 = px.imshow(
-        pivot_proj,
-        labels=dict(x="Batting Order Slot", y="Team", color="Proj FPTS"),
-        x=[f"#{c}" for c in pivot_proj.columns],
-        y=pivot_proj.index,
-        color_continuous_scale="Viridis",
-        text_auto=".1f",
-        aspect="auto",
-    )
-    fig1.update_layout(
-        height=calc_height,
-        margin=dict(l=20, r=20, t=30, b=20),
-        yaxis=dict(dtick=1),
-    )
-    st.plotly_chart(fig1, use_container_width=True)
-
-    st.markdown("---")
-    st.subheader("📊 Slate Game Schedule & Lineup Status Breakdown")
-
-    slate_summary_records = []
-    for team in sorted(df["Team"].unique()):
-      t_df = df[df["Team"] == team]
-      opp = t_df["Opponent"].iloc[0] if "Opponent" in t_df.columns else "OPP"
-      game_info = (
-          t_df["Game Info"].iloc[0] if "Game Info" in t_df.columns else "-"
-      )
-      status = (
-          t_df["LineupStatus"].iloc[0]
-          if "LineupStatus" in t_df.columns
-          else "PROJECTED 🟡"
-      )
-
-      sp_row = t_df[t_df["IsConfirmedStarter"] & (t_df["Position"] == "P")]
-      if sp_row.empty:
-        sp_row = t_df[t_df["Position"] == "P"].sort_values(
-            by="Projection", ascending=False
+        fig1.update_layout(
+            height=calc_height,
+            margin=dict(l=20, r=20, t=30, b=20),
+            yaxis=dict(dtick=1)
         )
-      sp_name = sp_row.iloc[0]["Name"] if not sp_row.empty else "None"
-      sp_salary = (
-          f"${sp_row.iloc[0]['Salary']:,}" if not sp_row.empty else "$0"
-      )
+        st.plotly_chart(fig1, use_container_width=True)
 
-      h_count = len(
-          t_df[
-              (t_df["Position"] != "P") & (t_df["BattingOrder"].between(1, 9))
-          ]
-      )
-      h_proj_sum = t_df[
-          (t_df["Position"] != "P") & (t_df["BattingOrder"].between(1, 9))
-      ]["Projection"].sum()
+        st.markdown("---")
+        st.subheader("📊 Slate Game Schedule & Lineup Status Breakdown")
+        
+        slate_summary_records = []
+        for team in sorted(df["Team"].unique()):
+            t_df = df[df["Team"] == team]
+            opp = t_df["Opponent"].iloc[0] if "Opponent" in t_df.columns else "OPP"
+            game_info = t_df["Game Info"].iloc[0] if "Game Info" in t_df.columns else "-"
+            status = t_df["LineupStatus"].iloc[0] if "LineupStatus" in t_df.columns else "PROJECTED 🟡"
+            
+            # Find active SP
+            sp_row = t_df[t_df["IsConfirmedStarter"] & (t_df["Position"] == "P")]
+            if sp_row.empty:
+                sp_row = t_df[t_df["Position"] == "P"].sort_values(by="Projection", ascending=False)
+            sp_name = sp_row.iloc[0]["Name"] if not sp_row.empty else "None"
+            sp_salary = f"${sp_row.iloc[0]['Salary']:,}" if not sp_row.empty else "$0"
+            
+            # Hitters
+            h_count = len(t_df[(t_df["Position"] != "P") & (t_df["BattingOrder"].between(1, 9))])
+            h_proj_sum = t_df[(t_df["Position"] != "P") & (t_df["BattingOrder"].between(1, 9))]["Projection"].sum()
+            
+            slate_summary_records.append({
+                "Team": team,
+                "Opponent": opp,
+                "Game Info / Time": game_info,
+                "Starting Pitcher": f"{sp_name} ({sp_salary})",
+                "Lineup Card Status": status,
+                "Active Hitters": f"{h_count} Bats",
+                "Total Hitter Proj": round(h_proj_sum, 1)
+            })
 
-      slate_summary_records.append({
-          "Team": team,
-          "Opponent": opp,
-          "Game Info / Time": game_info,
-          "Starting Pitcher": f"{sp_name} ({sp_salary})",
-          "Lineup Card Status": status,
-          "Active Hitters": f"{h_count} Bats",
-          "Total Hitter Proj": round(h_proj_sum, 1),
-      })
-
-    df_summary_table = pd.DataFrame(slate_summary_records)
-    st.dataframe(df_summary_table, use_container_width=True)
+        df_summary_table = pd.DataFrame(slate_summary_records)
+        st.dataframe(df_summary_table, use_container_width=True)
 
 with tab_opt:
-  st.subheader("Generate Lineups")
-  if st.button(
-      "⚡ Solve & Optimize Lineups", type="primary", use_container_width=True
-  ):
-    with st.spinner("Solving Linear Program with Matchup Constraints..."):
-      lineups = optimize_dk_mlb(
-          df,
-          stack_type=stack_strategy,
-          min_salary=min_sal,
-          max_salary=max_sal,
-          block_p_h=no_pitcher_vs_hitter,
-          block_p_p=no_opposing_pitchers,
-          apply_matchup_boost=use_matchup_projections,
-          limit_aces=limit_bats_vs_aces,
-          ace_sal_cutoff=ace_threshold,
-          max_bats_vs_ace=max_bats_vs_ace_val,
-          target_favorable=target_favorable_sps,
-          fav_sp_cutoff=favorable_sp_threshold,
-          max_own=max_roster_own,
-          num_lineups_to_gen=num_lineups,
-          max_overlap_val=max_overlap,
-          enforce_starters=starters_only,
-      )
+    st.subheader("Generate Lineups")
+    if st.button("⚡ Solve & Optimize Lineups", type="primary", use_container_width=True):
+        with st.spinner("Solving Linear Program with Matchup Constraints..."):
+            lineups = optimize_dk_mlb(
+                df,
+                stack_type=stack_strategy,
+                min_salary=min_sal,
+                max_salary=max_sal,
+                block_p_h=no_pitcher_vs_hitter,
+                block_p_p=no_opposing_pitchers,
+                apply_matchup_boost=use_matchup_projections,
+                limit_aces=limit_bats_vs_aces,
+                ace_sal_cutoff=ace_threshold,
+                max_bats_vs_ace=max_bats_vs_ace_val,
+                target_favorable=target_favorable_sps,
+                fav_sp_cutoff=favorable_sp_threshold,
+                stack_scope=stack_enforcement_scope,
+                max_own=max_roster_own,
+                num_lineups_to_gen=num_lineups,
+                max_overlap_val=max_overlap,
+                enforce_starters=starters_only
+            )
 
-    if lineups:
-      st.success(f"Generated {len(lineups)} optimal lineup(s)!")
-      for idx, l_df in enumerate(lineups):
-        total_s = l_df["Salary"].sum()
-        total_p = l_df["Proj"].sum()
-        total_o = l_df["Own%"].sum()
+        if lineups:
+            st.success(f"Generated {len(lineups)} optimal lineup(s)!")
+            for idx, l_df in enumerate(lineups):
+                total_s = l_df["Salary"].sum()
+                total_p = l_df["Proj"].sum()
+                total_o = l_df["Own%"].sum()
+                
+                hitters = l_df[l_df["Slot"] != "P"]
+                team_counts = hitters["Team"].value_counts().to_dict()
+                stack_desc = " + ".join([f"{count}x {team}" for team, count in team_counts.items()])
 
-        hitters = l_df[l_df["Slot"] != "P"]
-        team_counts = hitters["Team"].value_counts().to_dict()
-        stack_desc = " + ".join(
-            [f"{count}x {team}" for team, count in team_counts.items()]
-        )
+                st.markdown(f"### 📋 Lineup #{idx+1} — Stack: `{stack_desc}`")
+                
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Total Salary", f"${total_s:,}", delta=f"${50000 - total_s:,} left")
+                m2.metric("Projected Points", f"{total_p:.2f} pts")
+                m3.metric("Cumulative Ownership", f"{total_o:.1f}%")
+                m4.metric("Stack Composition", stack_desc)
 
-        st.markdown(f"### 📋 Lineup #{idx+1} — Stack: `{stack_desc}`")
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric(
-            "Total Salary", f"${total_s:,}", delta=f"${50000 - total_s:,} left"
-        )
-        m2.metric("Projected Points", f"{total_p:.2f} pts")
-        m3.metric("Cumulative Ownership", f"{total_o:.1f}%")
-        m4.metric("Stack Composition", stack_desc)
-
-        st.dataframe(
-            l_df.style.format(
-                {"Salary": "${:,.0f}", "Proj": "{:.1f}", "Own%": "{:.1f}%"}
-            ),
-            use_container_width=True,
-        )
-        st.markdown("---")
+                st.dataframe(
+                    l_df.style.format({
+                        "Salary": "${:,.0f}",
+                        "Proj": "{:.1f}",
+                        "Own%": "{:.1f}%"
+                    }),
+                    use_container_width=True
+                )
+                st.markdown("---")
